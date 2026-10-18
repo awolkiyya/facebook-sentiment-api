@@ -1,5 +1,23 @@
 services:
-  # Laravel application — PHP-FPM
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    env_file:
+      - .env.postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - backend
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    stop_grace_period: 60s
+
   app:
     image: asi-laravel-api:local
     build:
@@ -14,6 +32,8 @@ services:
     volumes:
       - storage:/var/www/storage
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     networks:
@@ -28,7 +48,6 @@ services:
       start_period: 40s
     stop_grace_period: 30s
 
-  # Laravel background queue worker
   queue-worker:
     image: asi-laravel-api:local
     restart: unless-stopped
@@ -48,13 +67,14 @@ services:
     depends_on:
       app:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     networks:
       - backend
     stop_grace_period: 100s
 
-  # Internal HTTP server — Traefik routes requests here
   nginx:
     image: asi-laravel-nginx:local
     build:
@@ -81,7 +101,6 @@ services:
       start_period: 10s
     stop_grace_period: 30s
 
-  # Redis — Laravel queue and cache backend
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -107,6 +126,7 @@ services:
     stop_grace_period: 30s
 
 volumes:
+  postgres_data:
   storage:
   redis_data:
 
@@ -114,7 +134,6 @@ networks:
   backend:
     driver: bridge
 
-  # External network created by the shared Traefik deployment
   traefik-public:
     external: true
     name: traefik-public

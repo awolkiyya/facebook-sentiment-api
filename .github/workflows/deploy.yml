@@ -20,40 +20,57 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    env:
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: 22
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
           command_timeout: 25m
+          envs: DEPLOY_PATH
+
           script: |
             set -eu
 
-            APP_DIR="/opt/asi-platform/apps/facebook-sentiment-api/repo"
+            APP_DIR="${DEPLOY_PATH:-/opt/asi-platform/apps/facebook-sentiment-api}"
 
             echo "=========================================="
             echo "Mayor Sentiment API Deployment"
             echo "Target: ASI Serv"
+            echo "Application: $APP_DIR"
             echo "=========================================="
+
+            # 1. Verify application directory
 
             if [ ! -d "$APP_DIR/.git" ]; then
               echo "ERROR: Git repository not found at $APP_DIR"
-              echo "Check APP_DIR before deploying."
+              echo "Expected the repository directly inside the API directory."
               exit 1
             fi
 
             cd "$APP_DIR"
 
+            # 2. Configure deployment failure diagnostics
+
             on_error() {
               status=$?
+
               if [ "$status" -ne 0 ]; then
                 echo ""
-                echo "DEPLOYMENT FAILED"
-                echo "Recent application logs:"
-                docker compose logs --tail=80 app nginx queue-worker redis || true
+                echo "=========================================="
+                echo "DEPLOYMENT FAILED (exit code: $status)"
+                echo "=========================================="
+
+                docker compose logs --tail=80 \
+                  app nginx queue-worker redis || true
+
                 echo ""
                 echo "Container status:"
                 docker compose ps || true
@@ -61,6 +78,8 @@ jobs:
             }
 
             trap on_error EXIT
+
+            # 3. Verify repository state
 
             echo ""
             echo "1. Checking repository state..."
@@ -74,14 +93,15 @@ jobs:
 
             if [ -n "$(git status --porcelain)" ]; then
               echo "ERROR: Working tree contains local changes."
-              echo "No changes have been discarded."
               git status --short
-              echo "Preserve or review these changes before deployment."
+              echo "No local changes have been discarded."
               exit 1
             fi
 
+            # 4. Fetch and fast-forward
+
             echo ""
-            echo "2. Fetching the latest main branch..."
+            echo "2. Fetching latest main branch..."
 
             git fetch origin main
 
@@ -96,36 +116,63 @@ jobs:
             echo "Deployed commit:"
             git log -1 --format='%h %s'
 
+            # 5. Validate deployment files
+
             echo ""
-            echo "3. Validating Docker Compose..."
+            echo "3. Checking required files..."
+
+            for FILE in \
+              compose.yaml \
+              Dockerfile
+            do
+              if [ ! -f "$FILE" ]; then
+                echo "ERROR: Required file is missing: $FILE"
+                exit 1
+              fi
+            done
+
+            # 6. Validate Docker and Compose
+
+            echo ""
+            echo "4. Validating Docker Compose..."
 
             docker --version
             docker compose version
-            docker compose config --quiet
+            docker compose -f compose.yaml config --quiet
+
+            # 7. Verify shared Traefik network
 
             echo ""
-            echo "4. Verifying required Traefik network..."
+            echo "5. Verifying Traefik network..."
 
             if ! docker network inspect traefik-public >/dev/null 2>&1; then
               echo "ERROR: traefik-public network does not exist."
-              echo "Deploy and configure the shared Traefik stack first."
+              echo "Configure the shared Traefik stack first."
               exit 1
             fi
 
-            echo ""
-            echo "5. Building production images..."
-
-            docker compose build app nginx
+            # 8. Build production images
 
             echo ""
-            echo "6. Starting Redis and Laravel HTTP services..."
+            echo "6. Building production images..."
 
-            docker compose up -d redis app nginx
+            docker compose -f compose.yaml build app nginx
+
+            # 9. Start application and Redis
 
             echo ""
-            echo "7. Waiting for Laravel application health..."
+            echo "7. Starting Laravel HTTP services..."
 
-            APP_CONTAINER="$(docker compose ps -q app)"
+            docker compose -f compose.yaml up -d redis app nginx
+
+            # 10. Wait for Laravel health
+
+            echo ""
+            echo "8. Waiting for Laravel application health..."
+
+            APP_CONTAINER="$(
+              docker compose -f compose.yaml ps -q app
+            )"
 
             if [ -z "$APP_CONTAINER" ]; then
               echo "ERROR: Laravel app container was not created."
@@ -134,11 +181,14 @@ jobs:
 
             ATTEMPTS=0
             MAX_ATTEMPTS=30
+            STATUS="starting"
 
             while [ "$ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; do
-              STATUS="$(docker inspect \
-                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' \
-                "$APP_CONTAINER")"
+              STATUS="$(
+                docker inspect \
+                  --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' \
+                  "$APP_CONTAINER" 2>/dev/null || true
+              )"
 
               if [ "$STATUS" = "healthy" ]; then
                 echo "Laravel application is healthy."
@@ -147,7 +197,13 @@ jobs:
 
               if [ "$STATUS" = "unhealthy" ]; then
                 echo "ERROR: Laravel application is unhealthy."
-                docker compose logs --tail=100 app
+                docker compose -f compose.yaml logs --tail=100 app
+                exit 1
+              fi
+
+              if [ "$STATUS" = "missing" ]; then
+                echo "ERROR: No Docker healthcheck is configured for app."
+                echo "Configure a valid healthcheck in compose.yaml."
                 exit 1
               fi
 
@@ -157,67 +213,79 @@ jobs:
 
             if [ "$STATUS" != "healthy" ]; then
               echo "ERROR: Timed out waiting for Laravel health."
-              docker compose logs --tail=100 app
+              docker compose -f compose.yaml logs --tail=100 app
               exit 1
             fi
 
-            echo ""
-            echo "8. Verifying Laravel package discovery..."
+            # 11. Verify Laravel package discovery
 
-            docker compose exec -T app \
+            echo ""
+            echo "9. Verifying Laravel package discovery..."
+
+            docker compose -f compose.yaml exec -T app \
               php artisan package:discover --ansi
 
-            echo ""
-            echo "9. Running database migrations..."
+            # 12. Run production database migrations
 
-            docker compose exec -T app \
+            echo ""
+            echo "10. Running database migrations..."
+
+            docker compose -f compose.yaml exec -T app \
               php artisan migrate --force
 
-            echo ""
-            echo "10. Rebuilding Laravel production caches..."
+            # 13. Rebuild Laravel caches
 
-            docker compose exec -T app \
+            echo ""
+            echo "11. Rebuilding Laravel production caches..."
+
+            docker compose -f compose.yaml exec -T app \
               php artisan optimize:clear
 
-            docker compose exec -T app \
+            docker compose -f compose.yaml exec -T app \
               php artisan config:cache
 
-            docker compose exec -T app \
+            docker compose -f compose.yaml exec -T app \
               php artisan route:cache
 
-            docker compose exec -T app \
+            docker compose -f compose.yaml exec -T app \
               php artisan view:cache
 
-            echo ""
-            echo "11. Verifying internal Nginx..."
+            # 14. Verify internal Nginx
 
-            docker compose exec -T nginx \
+            echo ""
+            echo "12. Verifying internal Nginx..."
+
+            docker compose -f compose.yaml exec -T nginx \
               wget -q -O /dev/null http://127.0.0.1/nginx-health
 
             echo "Internal Nginx health check passed."
 
-            echo ""
-            echo "12. Starting the queue worker..."
-
-            docker compose up -d queue-worker
+            # 15. Start queue worker
 
             echo ""
-            echo "13. Verifying services..."
+            echo "13. Starting queue worker..."
 
-            docker compose ps
+            docker compose -f compose.yaml up -d queue-worker
+
+            # 16. Verify final services
 
             echo ""
-            echo "Laravel application:"
-            docker compose exec -T app \
+            echo "14. Verifying deployed services..."
+
+            docker compose -f compose.yaml ps
+
+            echo ""
+            echo "Laravel environment:"
+            docker compose -f compose.yaml exec -T app \
               php artisan about --only=environment
 
             echo ""
             echo "Recent queue worker logs:"
-            docker compose logs --tail=20 queue-worker || true
+            docker compose -f compose.yaml logs --tail=20 queue-worker || true
 
             echo ""
             echo "=========================================="
-            echo "Deployment completed successfully."
+            echo "Laravel API deployment completed successfully."
             echo "=========================================="
 
             trap - EXIT
