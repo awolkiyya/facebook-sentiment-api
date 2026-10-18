@@ -19,9 +19,9 @@ Route::get('/ping', function () {
 Route::prefix('v1')->group(function () {
 
     // PUBLIC ROUTES
-    require base_path('routes/Api/v1/auth.php');
+    require base_path('routes/api/v1/auth.php');
 
-    require base_path('routes/Api/v1/facebook.php');
+    require base_path('routes/api/v1/facebook.php');
 
     /*
     |--------------------------------------------------------------------------
@@ -31,16 +31,16 @@ Route::prefix('v1')->group(function () {
 
     Route::middleware('auth:sanctum')->group(function () {
 
-        require base_path('routes/Api/v1/role.php');
-        require base_path('routes/Api/v1/permission.php');
-        require base_path('routes/Api/v1/user.php');
-        require base_path('routes/Api/v1/audit.php');
-        require base_path('routes/Api/v1/system-settings.php');
-        require base_path('routes/Api/v1/security.php');
-        require base_path('routes/Api/v1/notifications.php');
-        require base_path('routes/Api/v1/ai-models.php');
-        require base_path('routes/Api/v1/sync-runs.php');
-        require base_path('routes/Api/v1/ai-insight.php');
+        require base_path('routes/api/v1/role.php');
+        require base_path('routes/api/v1/permission.php');
+        require base_path('routes/api/v1/user.php');
+        require base_path('routes/api/v1/audit.php');
+        require base_path('routes/api/v1/system-settings.php');
+        require base_path('routes/api/v1/security.php');
+        require base_path('routes/api/v1/notifications.php');
+        require base_path('routes/api/v1/ai-models.php');
+        require base_path('routes/api/v1/sync-runs.php');
+        require base_path('routes/api/v1/ai-insight.php');
 
 
     });
