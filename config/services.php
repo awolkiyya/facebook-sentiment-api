@@ -60,5 +60,28 @@ return [
             30,
         ),
     ],
+    
+    'degertu_ai' => [
+        'chat_url' => env('DEGERTU_AI_CHAT_URL'),
+        'api_key' => env('DEGERTU_AI_API_KEY'),
+    
+        'default_model' => env(
+            'DEGERTU_AI_DEFAULT_MODEL',
+            'qwen2.5:7b'
+        ),
+        'num_predict' => (int) env('DEGERTU_AI_NUM_PREDICT', 1024),
+        'timeout' => (int) env('DEGERTU_AI_TIMEOUT', 120),
+        'think' => (bool) env('DEGERTU_AI_THINK', false),
+        'allowed_models' => array_values(array_filter(array_map(
+            'trim',
+            explode(
+                ',',
+                env(
+                    'DEGERTU_AI_ALLOWED_MODELS',
+                    'qwen2.5:7b,qwen3:32b'
+                )
+            )
+                ))),
+    ],
 
 ];

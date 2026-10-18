@@ -1,0 +1,223 @@
+name: Deploy Mayor Sentiment Laravel API
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+concurrency:
+  group: mayor-sentiment-api-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Laravel API to ASI Serv
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 25m
+          script: |
+            set -eu
+
+            APP_DIR="/opt/asi-platform/apps/facebook-sentiment-api/repo"
+
+            echo "=========================================="
+            echo "Mayor Sentiment API Deployment"
+            echo "Target: ASI Serv"
+            echo "=========================================="
+
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "ERROR: Git repository not found at $APP_DIR"
+              echo "Check APP_DIR before deploying."
+              exit 1
+            fi
+
+            cd "$APP_DIR"
+
+            on_error() {
+              status=$?
+              if [ "$status" -ne 0 ]; then
+                echo ""
+                echo "DEPLOYMENT FAILED"
+                echo "Recent application logs:"
+                docker compose logs --tail=80 app nginx queue-worker redis || true
+                echo ""
+                echo "Container status:"
+                docker compose ps || true
+              fi
+            }
+
+            trap on_error EXIT
+
+            echo ""
+            echo "1. Checking repository state..."
+
+            CURRENT_BRANCH="$(git branch --show-current)"
+
+            if [ "$CURRENT_BRANCH" != "main" ]; then
+              echo "ERROR: Expected branch main, found: $CURRENT_BRANCH"
+              exit 1
+            fi
+
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "ERROR: Working tree contains local changes."
+              echo "No changes have been discarded."
+              git status --short
+              echo "Preserve or review these changes before deployment."
+              exit 1
+            fi
+
+            echo ""
+            echo "2. Fetching the latest main branch..."
+
+            git fetch origin main
+
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "ERROR: Working tree changed during fetch."
+              exit 1
+            fi
+
+            git merge --ff-only origin/main
+
+            echo ""
+            echo "Deployed commit:"
+            git log -1 --format='%h %s'
+
+            echo ""
+            echo "3. Validating Docker Compose..."
+
+            docker --version
+            docker compose version
+            docker compose config --quiet
+
+            echo ""
+            echo "4. Verifying required Traefik network..."
+
+            if ! docker network inspect traefik-public >/dev/null 2>&1; then
+              echo "ERROR: traefik-public network does not exist."
+              echo "Deploy and configure the shared Traefik stack first."
+              exit 1
+            fi
+
+            echo ""
+            echo "5. Building production images..."
+
+            docker compose build app nginx
+
+            echo ""
+            echo "6. Starting Redis and Laravel HTTP services..."
+
+            docker compose up -d redis app nginx
+
+            echo ""
+            echo "7. Waiting for Laravel application health..."
+
+            APP_CONTAINER="$(docker compose ps -q app)"
+
+            if [ -z "$APP_CONTAINER" ]; then
+              echo "ERROR: Laravel app container was not created."
+              exit 1
+            fi
+
+            ATTEMPTS=0
+            MAX_ATTEMPTS=30
+
+            while [ "$ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; do
+              STATUS="$(docker inspect \
+                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' \
+                "$APP_CONTAINER")"
+
+              if [ "$STATUS" = "healthy" ]; then
+                echo "Laravel application is healthy."
+                break
+              fi
+
+              if [ "$STATUS" = "unhealthy" ]; then
+                echo "ERROR: Laravel application is unhealthy."
+                docker compose logs --tail=100 app
+                exit 1
+              fi
+
+              ATTEMPTS=$((ATTEMPTS + 1))
+              sleep 5
+            done
+
+            if [ "$STATUS" != "healthy" ]; then
+              echo "ERROR: Timed out waiting for Laravel health."
+              docker compose logs --tail=100 app
+              exit 1
+            fi
+
+            echo ""
+            echo "8. Verifying Laravel package discovery..."
+
+            docker compose exec -T app \
+              php artisan package:discover --ansi
+
+            echo ""
+            echo "9. Running database migrations..."
+
+            docker compose exec -T app \
+              php artisan migrate --force
+
+            echo ""
+            echo "10. Rebuilding Laravel production caches..."
+
+            docker compose exec -T app \
+              php artisan optimize:clear
+
+            docker compose exec -T app \
+              php artisan config:cache
+
+            docker compose exec -T app \
+              php artisan route:cache
+
+            docker compose exec -T app \
+              php artisan view:cache
+
+            echo ""
+            echo "11. Verifying internal Nginx..."
+
+            docker compose exec -T nginx \
+              wget -q -O /dev/null http://127.0.0.1/nginx-health
+
+            echo "Internal Nginx health check passed."
+
+            echo ""
+            echo "12. Starting the queue worker..."
+
+            docker compose up -d queue-worker
+
+            echo ""
+            echo "13. Verifying services..."
+
+            docker compose ps
+
+            echo ""
+            echo "Laravel application:"
+            docker compose exec -T app \
+              php artisan about --only=environment
+
+            echo ""
+            echo "Recent queue worker logs:"
+            docker compose logs --tail=20 queue-worker || true
+
+            echo ""
+            echo "=========================================="
+            echo "Deployment completed successfully."
+            echo "=========================================="
+
+            trap - EXIT

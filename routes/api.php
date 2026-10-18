@@ -40,6 +40,8 @@ Route::prefix('v1')->group(function () {
         require base_path('routes/Api/v1/notifications.php');
         require base_path('routes/Api/v1/ai-models.php');
         require base_path('routes/Api/v1/sync-runs.php');
+        require base_path('routes/Api/v1/ai-insight.php');
+
 
     });
 });

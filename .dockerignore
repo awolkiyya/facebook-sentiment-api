@@ -1,0 +1,73 @@
+
+# ============================================================
+# Git and version-control metadata
+# ============================================================
+.git/
+.gitignore
+
+# ============================================================
+# Environment files and secrets
+# ============================================================
+.env
+.env.*
+!.env.example
+
+# ============================================================
+# Dependencies installed inside the Docker image
+# ============================================================
+/vendor/
+/node_modules/
+
+# ============================================================
+# Local development and IDE files
+# ============================================================
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+yarn-debug.log*
+.phpunit.cache/
+.php-cs-fixer.cache/
+.phpstorm.meta.php
+
+# ============================================================
+# Tests and generated reports
+# ============================================================
+/coverage/
+/.phpunit.result.cache
+
+# ============================================================
+# Local runtime data
+# Keep the directory structure available for the image.
+# Do not copy local logs, sessions, caches, or compiled views.
+# ============================================================
+/storage/logs/*
+/storage/framework/cache/*
+/storage/framework/sessions/*
+/storage/framework/views/*
+/storage/framework/testing/*
+
+# ============================================================
+# Generated Laravel bootstrap caches
+# Regenerate these during deployment.
+# ============================================================
+/bootstrap/cache/*.php
+
+# ============================================================
+# Local database dumps and backups
+# ============================================================
+*.sql
+*.sql.gz
+*.dump
+*.bak
+/backups/
+
+# ============================================================
+# Docker Compose files are not needed inside the image
+# Keep the docker/ directory because the Dockerfile copies
+# docker/php/custom.ini.
+# ============================================================
+docker-compose*.yml
+docker-compose*.yaml

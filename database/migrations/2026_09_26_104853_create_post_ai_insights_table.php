@@ -6,9 +6,6 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
     public function up(): void
     {
         Schema::create('post_ai_insights', function (Blueprint $table) {
@@ -18,24 +15,29 @@ return new class extends Migration
             |--------------------------------------------------------------------------
             | Facebook Post
             |--------------------------------------------------------------------------
-            |
-            | Each Facebook post has one current AI-generated insight.
-            |
-            | When new comments are analyzed or the AI model changes,
-            | the existing insight is updated instead of creating
-            | another insight record.
-            |
             */
-            $table->uuid('facebook_post_id')->unique();
+
+            $table->uuid('facebook_post_id');
+
+            $table->string('language', 2)->default('en');
 
             /*
             |--------------------------------------------------------------------------
-            | Insight Content
+            | Generated Insight Content
             |--------------------------------------------------------------------------
+            |
+            | Nullable because the record can be created before AI generation
+            | finishes. Preserve previous successful content during regeneration.
+            |
             */
-            $table->text('summary');
+
+            $table->text('summary')->nullable();
 
             $table->text('key_concern')->nullable();
+
+            $table->jsonb('key_findings')->nullable();
+
+            $table->jsonb('recommendations')->nullable();
 
             $table->string('primary_topic')->nullable();
 
@@ -43,11 +45,8 @@ return new class extends Migration
             |--------------------------------------------------------------------------
             | Overall Classification
             |--------------------------------------------------------------------------
-            |
-            | These values represent the aggregated interpretation
-            | of the comments associated with the post.
-            |
             */
+
             $table->string('sentiment')->nullable();
 
             $table->string('priority')->nullable();
@@ -59,83 +58,101 @@ return new class extends Migration
             | Analysis Statistics
             |--------------------------------------------------------------------------
             */
+
             $table->unsignedInteger('analyzed_comments')->default(0);
 
-            /*
-            | Confidence returned by the insight generation process.
-            |
-            | Example:
-            | 0.9100 = 91%
-            |
-            */
             $table->decimal('confidence', 5, 4)->nullable();
 
             /*
             |--------------------------------------------------------------------------
-            | AI Model Information
+            | AI Model And Pipeline
             |--------------------------------------------------------------------------
-            |
-            | Stores which generative model produced the insight.
-            |
-            | Example:
-            | model_name    = qwen2.5:14b
-            | model_version = 1
-            |
             */
-            $table->string('model_name')->nullable();
 
-            $table->string('model_version')->nullable();
+            $table->string('model_name', 100)->nullable();
+
+            $table->string('model_version', 100)->nullable();
+
+            $table->string('analysis_version', 50)->default('v1');
 
             /*
             |--------------------------------------------------------------------------
-            | Analysis Pipeline Version
+            | Generation Lifecycle
             |--------------------------------------------------------------------------
             |
-            | Version of your own insight-generation pipeline.
-            |
-            | Example:
-            | v1
-            | v2
+            | PENDING, PROCESSING, COMPLETED, FAILED
             |
             */
-            $table->string('analysis_version')->default('v1');
+
+            $table->string('status', 20)->default('PENDING');
 
             /*
             |--------------------------------------------------------------------------
-            | Generation Metadata
+            | Evidence And Failure Tracking
             |--------------------------------------------------------------------------
             */
-            $table->timestamp('generated_at')->nullable();
+
+            $table->char('evidence_hash', 64)->nullable();
+
+            $table->string('evidence_version', 100)->nullable();
+
+            $table->text('error_message')->nullable();
+
+            $table->unsignedSmallInteger('generation_attempts')
+                ->default(0);
 
             /*
             |--------------------------------------------------------------------------
-            | Timestamps
+            | Optional Operational Metadata
             |--------------------------------------------------------------------------
             */
-            $table->timestamps();
+
+            $table->jsonb('metadata')->nullable();
 
             /*
             |--------------------------------------------------------------------------
-            | Indexes
+            | Generation Timestamp
             |--------------------------------------------------------------------------
             |
-            | facebook_post_id already has a unique index because of
-            | ->unique(), so no separate index is necessary.
+            | Update only after successful generation.
             |
             */
+
+            $table->timestampTz('generated_at')->nullable();
+
+            $table->timestampsTz();
+
+            /*
+            |--------------------------------------------------------------------------
+            | Constraints And Indexes
+            |--------------------------------------------------------------------------
+            |
+            | One current insight per post and language.
+            |
+            */
+
+            $table->unique(
+                ['facebook_post_id', 'language'],
+                'post_ai_insights_post_language_unique'
+            );
+
+            $table->index(
+                ['status', 'created_at'],
+                'post_ai_insights_status_created_index'
+            );
+
             $table->index('priority');
 
             $table->index('sentiment');
 
             $table->index('primary_topic');
 
-            $table->index('generated_at');
-
             /*
             |--------------------------------------------------------------------------
-            | Foreign Key
+            | Facebook Post Relationship
             |--------------------------------------------------------------------------
             */
+
             $table->foreign('facebook_post_id')
                 ->references('id')
                 ->on('facebook_posts')
@@ -143,9 +160,6 @@ return new class extends Migration
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
         Schema::dropIfExists('post_ai_insights');

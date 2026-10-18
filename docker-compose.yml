@@ -1,0 +1,120 @@
+services:
+  # Laravel application — PHP-FPM
+  app:
+    image: asi-laravel-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    working_dir: /var/www
+    env_file:
+      - .env
+    expose:
+      - "9000"
+    volumes:
+      - storage:/var/www/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - php artisan about --only=environment >/dev/null 2>&1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    stop_grace_period: 30s
+
+  # Laravel background queue worker
+  queue-worker:
+    image: asi-laravel-api:local
+    restart: unless-stopped
+    working_dir: /var/www
+    env_file:
+      - .env
+    command:
+      - php
+      - artisan
+      - queue:work
+      - redis
+      - --sleep=3
+      - --tries=3
+      - --timeout=90
+    volumes:
+      - storage:/var/www/storage
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+    stop_grace_period: 100s
+
+  # Internal HTTP server — Traefik routes requests here
+  nginx:
+    image: asi-laravel-nginx:local
+    build:
+      context: .
+      dockerfile: docker/nginx.Dockerfile
+    restart: unless-stopped
+    expose:
+      - "80"
+    volumes:
+      - storage:/var/www/storage:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - backend
+      - traefik-public
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1/nginx-health || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 30s
+
+  # Redis — Laravel queue and cache backend
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+
+volumes:
+  storage:
+  redis_data:
+
+networks:
+  backend:
+    driver: bridge
+
+  # External network created by the shared Traefik deployment
+  traefik-public:
+    external: true
+    name: traefik-public
