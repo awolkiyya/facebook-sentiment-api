@@ -1,7 +1,7 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
-use App\Support\ApiResponse;
+use App\Services\ApiResponse;
 use App\Http\Controllers\MfaController;
 
 // API HEALTH CHECK
