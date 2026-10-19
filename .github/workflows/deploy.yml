@@ -54,6 +54,7 @@ jobs:
             WORKER_STOPPED=0
             CURRENT_STEP="Initializing deployment"
             BACKUP_FILE=""
+            DEPLOY_COMMIT=""
 
             echo "=========================================="
             echo "Mayor Sentiment API Deployment"
@@ -61,12 +62,29 @@ jobs:
             echo "Application: $APP_DIR"
             echo "=========================================="
 
+            # --------------------------------------------------
+            # 1. Verify repository and Compose configuration
+            # --------------------------------------------------
+
+            CURRENT_STEP="Checking deployment prerequisites"
+            echo ""
+            echo "1. Checking deployment prerequisites..."
+
             if [ ! -d "$APP_DIR/.git" ]; then
               echo "ERROR: Git repository not found: $APP_DIR"
               exit 1
             fi
 
             cd "$APP_DIR"
+
+            docker --version
+            docker compose version
+            git --version
+
+            if ! docker network inspect traefik-public >/dev/null 2>&1; then
+              echo "ERROR: Docker network traefik-public is missing."
+              exit 1
+            fi
 
             if [ -f compose.yaml ]; then
               COMPOSE_FILE="compose.yaml"
@@ -84,6 +102,27 @@ jobs:
             dc() {
               docker compose -f "$COMPOSE_FILE" "$@"
             }
+
+            if [ ! -f .env ] || [ ! -f .env.postgres ]; then
+              echo "ERROR: Required .env or .env.postgres is missing."
+              exit 1
+            fi
+
+            # Production secrets must not be group/world-readable.
+            chmod 600 .env .env.postgres
+
+            case "${RUN_SEEDERS:-false}" in
+              true|false)
+                ;;
+              *)
+                echo "ERROR: RUN_SEEDERS must be true or false."
+                exit 1
+                ;;
+            esac
+
+            # --------------------------------------------------
+            # Failure handler
+            # --------------------------------------------------
 
             on_exit() {
               STATUS=$?
@@ -105,7 +144,7 @@ jobs:
                 dc ps
 
                 echo ""
-                echo "--- Recent application logs ---"
+                echo "--- Recent service logs ---"
                 dc logs --tail=100 \
                   app nginx queue-worker postgres redis
 
@@ -113,7 +152,10 @@ jobs:
                   echo ""
                   echo "--- Attempting queue-worker recovery ---"
 
-                  if dc up -d queue-worker; then
+                  # Start the existing stopped container where possible.
+                  # Avoid implicitly recreating it with the new image
+                  # when a deployment has failed before application rollout.
+                  if dc start queue-worker; then
                     WORKER_CONTAINER="$(dc ps -q queue-worker)"
 
                     if [ -n "$WORKER_CONTAINER" ]; then
@@ -133,13 +175,14 @@ jobs:
                       echo "WARNING: Queue worker container was not found."
                     fi
                   else
-                    echo "WARNING: Queue worker recovery failed."
+                    echo "WARNING: Could not restart the existing queue worker."
+                    echo "Check the worker container and database compatibility."
                   fi
                 fi
 
                 echo ""
                 echo "No automatic database rollback was attempted."
-                echo "Check migration status before retrying."
+                echo "Inspect migration status before retrying."
               fi
 
               exit "$STATUS"
@@ -147,34 +190,9 @@ jobs:
 
             trap on_exit EXIT
 
-            CURRENT_STEP="Checking deployment prerequisites"
-            echo ""
-            echo "1. Checking deployment prerequisites..."
-
-            docker --version
-            docker compose version
-            git --version
-
-            if ! docker network inspect traefik-public >/dev/null 2>&1; then
-              echo "ERROR: Docker network traefik-public is missing."
-              exit 1
-            fi
-
-            if [ ! -f .env ] || [ ! -f .env.postgres ]; then
-              echo "ERROR: Required .env or .env.postgres is missing."
-              exit 1
-            fi
-
-            chmod 600 .env .env.postgres
-
-            case "${RUN_SEEDERS:-false}" in
-              true|false)
-                ;;
-              *)
-                echo "ERROR: RUN_SEEDERS must be true or false."
-                exit 1
-                ;;
-            esac
+            # --------------------------------------------------
+            # 2. Validate repository state
+            # --------------------------------------------------
 
             CURRENT_STEP="Validating repository state"
             echo ""
@@ -197,8 +215,6 @@ jobs:
               exit 1
             fi
 
-            # Keep the server-specific PostgreSQL environment file
-            # outside Git's working-tree status checks.
             EXCLUDE_FILE="$(git rev-parse --git-path info/exclude)"
             touch "$EXCLUDE_FILE"
 
@@ -212,6 +228,10 @@ jobs:
               exit 1
             fi
 
+            # --------------------------------------------------
+            # 3. Fetch and update main
+            # --------------------------------------------------
+
             CURRENT_STEP="Fetching and updating main"
             echo ""
             echo "3. Fetching the latest main branch..."
@@ -224,8 +244,8 @@ jobs:
               exit 1
             fi
 
-            # Scope umask 022 to Git's update operation only.
-            # Keep the deployment shell's restrictive umask.
+            # Keep the deployment shell restrictive while ensuring
+            # newly checked-out files are not created with mode 600.
             if ! (umask 022; git merge --ff-only origin/main); then
               echo "ERROR: Could not fast-forward to origin/main."
               echo "Resolve repository divergence before deploying."
@@ -236,6 +256,10 @@ jobs:
 
             echo "Deploying commit: $DEPLOY_COMMIT"
             git log -1 --format='%h %s'
+
+            # --------------------------------------------------
+            # 4. Validate files and normalize source permissions
+            # --------------------------------------------------
 
             CURRENT_STEP="Validating application files and permissions"
             echo ""
@@ -248,7 +272,8 @@ jobs:
               nginx/default.conf \
               composer.json \
               composer.lock \
-              routes/api/v1/facebook.php
+              routes/api/v1/facebook.php \
+              app/Http/Controllers/Api/Facebook/FacebookPostController.php
             do
               if [ ! -f "$FILE" ]; then
                 echo "ERROR: Required file missing: $FILE"
@@ -256,25 +281,41 @@ jobs:
               fi
             done
 
-            # Git tracks executable status, not arbitrary Unix permission
-            # bits. Explicitly restore readable permissions on this route.
-            chmod 644 routes/api/v1/facebook.php
+            # Laravel source directories must be traversable.
+            # Source files must be readable by the PHP runtime.
+            # These directories should contain application source,
+            # not private keys or environment files.
+            for DIR in app bootstrap config database resources routes; do
+              if [ -d "$DIR" ]; then
+                find "$DIR" -type d -exec chmod 755 {} +
+                find "$DIR" -type f -exec chmod 644 {} +
+              fi
+            done
 
-            ROUTE_MODE="$(stat -c '%a' routes/api/v1/facebook.php)"
+            for FILE in \
+              routes/api/v1/facebook.php \
+              app/Http/Controllers/Api/Facebook/FacebookPostController.php
+            do
+              MODE="$(stat -c '%a' "$FILE")"
 
-            if [ "$ROUTE_MODE" != "644" ]; then
-              echo "ERROR: Unexpected Facebook route permissions: $ROUTE_MODE"
-              stat -c '%A %a %U:%G %n' routes/api/v1/facebook.php
-              exit 1
-            fi
+              if [ "$MODE" != "644" ]; then
+                echo "ERROR: Unexpected permissions for $FILE: $MODE"
+                stat -c '%A %a %U:%G %n' "$FILE"
+                exit 1
+              fi
 
-            echo "Facebook route permissions:"
-            stat -c '%A %a %U:%G %n' routes/api/v1/facebook.php
+              echo "Verified source file:"
+              stat -c '%A %a %U:%G %n' "$FILE"
+            done
 
             if ! git diff --check; then
               echo "ERROR: Git whitespace/conflict-marker checks failed."
               exit 1
             fi
+
+            # --------------------------------------------------
+            # 5. Validate Compose configuration
+            # --------------------------------------------------
 
             CURRENT_STEP="Validating Docker Compose configuration"
             echo ""
@@ -282,46 +323,72 @@ jobs:
 
             dc config --quiet
 
+            # --------------------------------------------------
+            # 6. Build production images
+            # --------------------------------------------------
+
             CURRENT_STEP="Building production images"
             echo ""
             echo "6. Building production images..."
 
             dc build app nginx
 
+            # --------------------------------------------------
+            # 7. Validate files in the built Laravel image
+            # --------------------------------------------------
+
             CURRENT_STEP="Validating built Laravel image"
             echo ""
-            echo "7. Validating Laravel route in the built image..."
+            echo "7. Validating Laravel source files in the built image..."
 
-            # Run using the service's configured user and mounts.
-            # Require the route to be readable and have mode 644.
             if ! dc run --rm --no-deps --entrypoint sh app -lc '
               set -eu
-              FILE=/var/www/routes/api/v1/facebook.php
 
-              test -f "$FILE"
-              MODE="$(stat -c "%a" "$FILE")"
+              for FILE in \
+                /var/www/routes/api/v1/facebook.php \
+                /var/www/app/Http/Controllers/Api/Facebook/FacebookPostController.php
+              do
+                if [ ! -f "$FILE" ]; then
+                  echo "ERROR: Missing file: $FILE"
+                  exit 1
+                fi
 
-              echo "Route file: $FILE"
-              stat -c "%A %a %U:%G %n" "$FILE"
+                MODE="$(stat -c "%a" "$FILE")"
 
-              if [ "$MODE" != "644" ]; then
-                echo "ERROR: Expected route file mode 644; found $MODE."
-                exit 1
-              fi
+                echo "Checking $FILE"
+                stat -c "%A %a %U:%G %n" "$FILE"
 
-              test -r "$FILE"
-              php -l "$FILE"
+                if [ "$MODE" != "644" ]; then
+                  echo "ERROR: Expected mode 644; found $MODE"
+                  exit 1
+                fi
+
+                if [ ! -r "$FILE" ]; then
+                  echo "ERROR: File is not readable: $FILE"
+                  exit 1
+                fi
+
+                php -l "$FILE"
+              done
             '; then
-              echo "ERROR: Laravel image route permission/syntax check failed."
+              echo "ERROR: Laravel source permission or syntax validation failed."
               echo "Inspect Dockerfile COPY instructions and Compose mounts."
               exit 1
             fi
+
+            # --------------------------------------------------
+            # 8. Start PostgreSQL and Redis
+            # --------------------------------------------------
 
             CURRENT_STEP="Starting PostgreSQL and Redis"
             echo ""
             echo "8. Starting PostgreSQL and Redis..."
 
             dc up -d postgres redis
+
+            # --------------------------------------------------
+            # 9. Wait for PostgreSQL
+            # --------------------------------------------------
 
             CURRENT_STEP="Waiting for PostgreSQL"
             echo ""
@@ -343,6 +410,10 @@ jobs:
             done
 
             echo "PostgreSQL is accepting connections."
+
+            # --------------------------------------------------
+            # 10. Wait for Redis
+            # --------------------------------------------------
 
             CURRENT_STEP="Checking Redis"
             echo ""
@@ -370,16 +441,106 @@ jobs:
 
             echo "Redis is responding."
 
+            # --------------------------------------------------
+            # 11. Back up PostgreSQL before migrations
+            # --------------------------------------------------
+
+            CURRENT_STEP="Backing up PostgreSQL"
+            echo ""
+            echo "11. Backing up PostgreSQL before migrations..."
+
+            mkdir -p "$BACKUP_DIR"
+            chmod 700 "$BACKUP_DIR"
+
+            BACKUP_FILE="$BACKUP_DIR/adama-civic-intelligence-$(date -u +%Y%m%dT%H%M%SZ).sql"
+
+            if ! dc exec -T postgres sh -ec '
+              test -n "${POSTGRES_USER:-}"
+              test -n "${POSTGRES_DB:-}"
+
+              pg_dump --no-owner --no-privileges \
+                -U "$POSTGRES_USER" "$POSTGRES_DB"
+            ' > "$BACKUP_FILE"; then
+              rm -f "$BACKUP_FILE"
+              echo "ERROR: PostgreSQL backup command failed."
+              exit 1
+            fi
+
+            if [ ! -s "$BACKUP_FILE" ]; then
+              rm -f "$BACKUP_FILE"
+              echo "ERROR: PostgreSQL backup is empty."
+              exit 1
+            fi
+
+            chmod 600 "$BACKUP_FILE"
+
+            echo "Database backup created successfully."
+            ls -lh "$BACKUP_FILE"
+
+            # --------------------------------------------------
+            # 12. Stop queue worker before schema changes
+            # --------------------------------------------------
+
             CURRENT_STEP="Stopping queue worker"
             echo ""
-            echo "11. Stopping the queue worker..."
+            echo "12. Stopping the queue worker..."
 
             dc stop queue-worker
             WORKER_STOPPED=1
 
+            # --------------------------------------------------
+            # 13. Run migrations using the newly built image
+            # --------------------------------------------------
+
+            CURRENT_STEP="Running production migrations"
+            echo ""
+            echo "13. Running production migrations..."
+
+            # A one-off container uses the new app image without
+            # replacing the currently serving application container.
+            if ! dc run --rm --no-deps app \
+              php artisan migrate --force -vvv; then
+              echo "ERROR: Production migrations failed."
+              echo "Current migration status follows."
+
+              dc run --rm --no-deps app \
+                php artisan migrate:status || true
+
+              echo "Database backup: $BACKUP_FILE"
+              echo "No automatic database rollback was attempted."
+              exit 1
+            fi
+
+            echo "Production migrations completed."
+
+            # --------------------------------------------------
+            # 14. Run optional production seeders
+            # --------------------------------------------------
+
+            CURRENT_STEP="Running optional production seeders"
+            echo ""
+            echo "14. Running optional production seeders..."
+
+            if [ "${RUN_SEEDERS:-false}" = "true" ]; then
+              echo "Seeder execution explicitly enabled."
+
+              if ! dc run --rm --no-deps app \
+                php artisan db:seed --force; then
+                echo "ERROR: Production database seeders failed."
+                echo "Database backup: $BACKUP_FILE"
+                exit 1
+              fi
+            else
+              echo "Seeders skipped."
+            fi
+
+            # --------------------------------------------------
+            # 15. Start the updated Laravel application
+            # --------------------------------------------------
+
             CURRENT_STEP="Starting Laravel application"
             echo ""
-            echo "12. Starting the Laravel application..."
+            echo "15. Starting the updated Laravel application..."
 
             dc up -d app
 
@@ -390,9 +551,13 @@ jobs:
               exit 1
             fi
 
+            # --------------------------------------------------
+            # 16. Wait for Laravel health
+            # --------------------------------------------------
+
             CURRENT_STEP="Waiting for Laravel health"
             echo ""
-            echo "13. Waiting for Laravel health..."
+            echo "16. Waiting for Laravel health..."
 
             ATTEMPTS=0
             MAX_ATTEMPTS=36
@@ -428,93 +593,52 @@ jobs:
 
             echo "Laravel container is healthy."
 
-            CURRENT_STEP="Verifying Laravel route registration"
-            echo ""
-            echo "14. Verifying Laravel route registration..."
-
-            if ! dc exec -T app php artisan route:list --path=ping; then
-              echo "ERROR: Laravel failed to register routes."
-              dc logs --tail=100 app
-              exit 1
-            fi
+            # --------------------------------------------------
+            # 17. Rebuild Laravel caches
+            # --------------------------------------------------
 
             CURRENT_STEP="Rebuilding Laravel caches"
             echo ""
-            echo "15. Rebuilding Laravel caches..."
+            echo "17. Rebuilding Laravel caches..."
 
             dc exec -T app php artisan optimize:clear
             dc exec -T app php artisan package:discover --ansi
             dc exec -T app php artisan config:cache
             dc exec -T app php artisan view:cache
 
-            CURRENT_STEP="Backing up PostgreSQL"
+            # --------------------------------------------------
+            # 18. Validate route registration
+            # --------------------------------------------------
+
+            CURRENT_STEP="Verifying Laravel route registration"
             echo ""
-            echo "16. Backing up PostgreSQL before migrations..."
+            echo "18. Verifying Laravel route registration..."
 
-            mkdir -p "$BACKUP_DIR"
-            chmod 700 "$BACKUP_DIR"
-
-            BACKUP_FILE="$BACKUP_DIR/adama-civic-intelligence-$(date -u +%Y%m%dT%H%M%SZ).sql"
-
-            if ! dc exec -T postgres sh -ec '
-              test -n "${POSTGRES_USER:-}"
-              test -n "${POSTGRES_DB:-}"
-
-              pg_dump --no-owner --no-privileges \
-                -U "$POSTGRES_USER" "$POSTGRES_DB"
-            ' > "$BACKUP_FILE"; then
-              rm -f "$BACKUP_FILE"
-              echo "ERROR: PostgreSQL backup command failed."
+            if ! dc exec -T app php artisan route:list --path=ping; then
+              echo "ERROR: Ping route registration failed."
+              dc logs --tail=100 app
               exit 1
             fi
 
-            if [ ! -s "$BACKUP_FILE" ]; then
-              rm -f "$BACKUP_FILE"
-              echo "ERROR: PostgreSQL backup is empty."
+            if ! dc exec -T app php artisan route:list --path=facebook/pages; then
+              echo "ERROR: Facebook pages route registration failed."
+              dc logs --tail=100 app
               exit 1
             fi
 
-            chmod 600 "$BACKUP_FILE"
-
-            echo "Database backup created successfully."
-            ls -lh "$BACKUP_FILE"
-
-            CURRENT_STEP="Running production migrations"
-            echo ""
-            echo "17. Running production migrations..."
-
-            if ! dc exec -T app php artisan migrate --force -vvv; then
-              echo "ERROR: Laravel production migrations failed."
-              echo "Current migration status follows."
-
-              dc exec -T app php artisan migrate:status || true
-
-              echo "No automatic database rollback was attempted."
-              exit 1
-            fi
-
-            echo "Production migrations completed."
-
-            CURRENT_STEP="Running optional production seeders"
-            echo ""
-            echo "18. Running optional production seeders..."
-
-            if [ "${RUN_SEEDERS:-false}" = "true" ]; then
-              echo "Seeder execution explicitly enabled."
-
-              if ! dc exec -T app php artisan db:seed --force; then
-                echo "ERROR: Production database seeders failed."
-                exit 1
-              fi
-            else
-              echo "Seeders skipped."
-            fi
+            # --------------------------------------------------
+            # 19. Start updated Nginx
+            # --------------------------------------------------
 
             CURRENT_STEP="Starting updated Nginx"
             echo ""
             echo "19. Starting updated Nginx..."
 
             dc up -d nginx
+
+            # --------------------------------------------------
+            # 20. Check Nginx health
+            # --------------------------------------------------
 
             CURRENT_STEP="Checking Nginx health"
             echo ""
@@ -544,6 +668,10 @@ jobs:
 
             echo "Nginx health check passed."
 
+            # --------------------------------------------------
+            # 21. Test the API
+            # --------------------------------------------------
+
             CURRENT_STEP="Testing Laravel API"
             echo ""
             echo "21. Testing the Laravel API..."
@@ -565,6 +693,10 @@ jobs:
 
             echo "API smoke test passed."
             printf '%s\n' "$API_RESPONSE"
+
+            # --------------------------------------------------
+            # 22. Restart and verify queue worker
+            # --------------------------------------------------
 
             CURRENT_STEP="Restarting and verifying queue worker"
             echo ""
@@ -593,6 +725,10 @@ jobs:
 
             WORKER_STOPPED=0
             echo "Queue worker is running."
+
+            # --------------------------------------------------
+            # 23. Final verification
+            # --------------------------------------------------
 
             CURRENT_STEP="Final service verification"
             echo ""
