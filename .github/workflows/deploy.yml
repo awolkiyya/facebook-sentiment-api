@@ -47,17 +47,12 @@ jobs:
             echo "Application: $APP_DIR"
             echo "=========================================="
 
-            # 1. Verify application directory
-
             if [ ! -d "$APP_DIR/.git" ]; then
-              echo "ERROR: Git repository not found at $APP_DIR"
-              echo "Expected the repository directly inside the API directory."
+              echo "ERROR: Git repository not found."
               exit 1
             fi
 
             cd "$APP_DIR"
-
-            # 2. Configure deployment failure diagnostics
 
             on_error() {
               status=$?
@@ -65,21 +60,27 @@ jobs:
               if [ "$status" -ne 0 ]; then
                 echo ""
                 echo "=========================================="
-                echo "DEPLOYMENT FAILED (exit code: $status)"
+                echo "DEPLOYMENT FAILED: exit code $status"
                 echo "=========================================="
 
-                docker compose logs --tail=80 \
-                  app nginx queue-worker redis || true
+                docker compose -f "$COMPOSE_FILE" logs \
+                  --tail=80 app nginx queue-worker postgres redis 2>/dev/null || true
 
-                echo ""
-                echo "Container status:"
-                docker compose ps || true
+                docker compose -f "$COMPOSE_FILE" ps || true
               fi
             }
 
-            trap on_error EXIT
+            # Select the repository's actual Compose filename.
+            if [ -f compose.yaml ]; then
+              COMPOSE_FILE="compose.yaml"
+            elif [ -f docker-compose.yml ]; then
+              COMPOSE_FILE="docker-compose.yml"
+            else
+              echo "ERROR: No supported Compose file found."
+              exit 1
+            fi
 
-            # 3. Verify repository state
+            trap on_error EXIT
 
             echo ""
             echo "1. Checking repository state..."
@@ -87,21 +88,18 @@ jobs:
             CURRENT_BRANCH="$(git branch --show-current)"
 
             if [ "$CURRENT_BRANCH" != "main" ]; then
-              echo "ERROR: Expected branch main, found: $CURRENT_BRANCH"
+              echo "ERROR: Expected branch main; found $CURRENT_BRANCH."
               exit 1
             fi
 
             if [ -n "$(git status --porcelain)" ]; then
               echo "ERROR: Working tree contains local changes."
               git status --short
-              echo "No local changes have been discarded."
               exit 1
             fi
 
-            # 4. Fetch and fast-forward
-
             echo ""
-            echo "2. Fetching latest main branch..."
+            echo "2. Fetching latest main..."
 
             git fetch origin main
 
@@ -112,18 +110,19 @@ jobs:
 
             git merge --ff-only origin/main
 
-            echo ""
-            echo "Deployed commit:"
+            echo "Deploying commit:"
             git log -1 --format='%h %s'
-
-            # 5. Validate deployment files
 
             echo ""
             echo "3. Checking required files..."
 
             for FILE in \
-              compose.yaml \
-              Dockerfile
+              Dockerfile \
+              docker/nginx.Dockerfile \
+              docker/php/custom.ini \
+              nginx/default.conf \
+              composer.json \
+              composer.lock
             do
               if [ ! -f "$FILE" ]; then
                 echo "ERROR: Required file is missing: $FILE"
@@ -131,47 +130,43 @@ jobs:
               fi
             done
 
-            # 6. Validate Docker and Compose
+            if [ ! -f .env ] || [ ! -f .env.postgres ]; then
+              echo "ERROR: Required runtime environment file is missing."
+              exit 1
+            fi
 
             echo ""
             echo "4. Validating Docker Compose..."
 
             docker --version
             docker compose version
-            docker compose -f compose.yaml config --quiet
-
-            # 7. Verify shared Traefik network
+            docker compose -f "$COMPOSE_FILE" config --quiet
 
             echo ""
-            echo "5. Verifying Traefik network..."
+            echo "5. Checking the shared Traefik network..."
 
             if ! docker network inspect traefik-public >/dev/null 2>&1; then
               echo "ERROR: traefik-public network does not exist."
-              echo "Configure the shared Traefik stack first."
               exit 1
             fi
 
-            # 8. Build production images
+            echo ""
+            echo "6. Building application images..."
+
+            docker compose -f "$COMPOSE_FILE" build app nginx
 
             echo ""
-            echo "6. Building production images..."
+            echo "7. Starting application dependencies..."
 
-            docker compose -f compose.yaml build app nginx
-
-            # 9. Start application and Redis
+            docker compose -f "$COMPOSE_FILE" up -d postgres redis
 
             echo ""
-            echo "7. Starting Laravel HTTP services..."
+            echo "8. Starting Laravel and Nginx..."
 
-            docker compose -f compose.yaml up -d redis app nginx
-
-            # 10. Wait for Laravel health
-
-            echo ""
-            echo "8. Waiting for Laravel application health..."
+            docker compose -f "$COMPOSE_FILE" up -d app nginx
 
             APP_CONTAINER="$(
-              docker compose -f compose.yaml ps -q app
+              docker compose -f "$COMPOSE_FILE" ps -q app
             )"
 
             if [ -z "$APP_CONTAINER" ]; then
@@ -179,8 +174,11 @@ jobs:
               exit 1
             fi
 
+            echo ""
+            echo "9. Waiting for Laravel health..."
+
             ATTEMPTS=0
-            MAX_ATTEMPTS=30
+            MAX_ATTEMPTS=36
             STATUS="starting"
 
             while [ "$ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; do
@@ -195,15 +193,9 @@ jobs:
                 break
               fi
 
-              if [ "$STATUS" = "unhealthy" ]; then
-                echo "ERROR: Laravel application is unhealthy."
-                docker compose -f compose.yaml logs --tail=100 app
-                exit 1
-              fi
-
-              if [ "$STATUS" = "missing" ]; then
-                echo "ERROR: No Docker healthcheck is configured for app."
-                echo "Configure a valid healthcheck in compose.yaml."
+              if [ "$STATUS" = "unhealthy" ] || [ "$STATUS" = "missing" ]; then
+                echo "ERROR: Laravel health check failed: $STATUS"
+                docker compose -f "$COMPOSE_FILE" logs --tail=100 app
                 exit 1
               fi
 
@@ -212,80 +204,83 @@ jobs:
             done
 
             if [ "$STATUS" != "healthy" ]; then
-              echo "ERROR: Timed out waiting for Laravel health."
-              docker compose -f compose.yaml logs --tail=100 app
+              echo "ERROR: Timed out waiting for Laravel."
+              docker compose -f "$COMPOSE_FILE" logs --tail=100 app
               exit 1
             fi
 
-            # 11. Verify Laravel package discovery
-
             echo ""
-            echo "9. Verifying Laravel package discovery..."
+            echo "10. Preparing Laravel package discovery..."
 
-            docker compose -f compose.yaml exec -T app \
+            docker compose -f "$COMPOSE_FILE" exec -T app \
               php artisan package:discover --ansi
 
-            # 12. Run production database migrations
-
             echo ""
-            echo "10. Running database migrations..."
+            echo "11. Rebuilding Laravel configuration cache..."
 
-            docker compose -f compose.yaml exec -T app \
-              php artisan migrate --force
-
-            # 13. Rebuild Laravel caches
-
-            echo ""
-            echo "11. Rebuilding Laravel production caches..."
-
-            docker compose -f compose.yaml exec -T app \
+            docker compose -f "$COMPOSE_FILE" exec -T app \
               php artisan optimize:clear
 
-            docker compose -f compose.yaml exec -T app \
+            docker compose -f "$COMPOSE_FILE" exec -T app \
               php artisan config:cache
 
-            docker compose -f compose.yaml exec -T app \
-              php artisan route:cache
+            echo ""
+            echo "12. Running production database migrations..."
 
-            docker compose -f compose.yaml exec -T app \
+            docker compose -f "$COMPOSE_FILE" exec -T app \
+              php artisan migrate --force
+
+            echo ""
+            echo "13. Caching Laravel views..."
+
+            docker compose -f "$COMPOSE_FILE" exec -T app \
               php artisan view:cache
 
-            # 14. Verify internal Nginx
+            echo ""
+            echo "14. Verifying Nginx health..."
+
+            docker compose -f "$COMPOSE_FILE" exec -T nginx \
+              wget -q -O /dev/null \
+              http://127.0.0.1/nginx-health
+
+            echo "Nginx health check passed."
 
             echo ""
-            echo "12. Verifying internal Nginx..."
+            echo "15. Testing the Laravel API response..."
 
-            docker compose -f compose.yaml exec -T nginx \
-              wget -q -O /dev/null http://127.0.0.1/nginx-health
+            API_RESPONSE="$(
+              docker compose -f "$COMPOSE_FILE" exec -T nginx \
+                wget -q -O - http://127.0.0.1/api/ping
+            )"
 
-            echo "Internal Nginx health check passed."
+            if ! printf '%s' "$API_RESPONSE" | grep -q '"success":true'; then
+              echo "ERROR: API smoke test failed."
+              echo "The API did not return the expected success field."
+              exit 1
+            fi
 
-            # 15. Start queue worker
-
-            echo ""
-            echo "13. Starting queue worker..."
-
-            docker compose -f compose.yaml up -d queue-worker
-
-            # 16. Verify final services
-
-            echo ""
-            echo "14. Verifying deployed services..."
-
-            docker compose -f compose.yaml ps
+            echo "API smoke test passed."
 
             echo ""
-            echo "Laravel environment:"
-            docker compose -f compose.yaml exec -T app \
-              php artisan about --only=environment
+            echo "16. Restarting the queue worker..."
+
+            docker compose -f "$COMPOSE_FILE" up -d \
+              --force-recreate queue-worker
 
             echo ""
-            echo "Recent queue worker logs:"
-            docker compose -f compose.yaml logs --tail=20 queue-worker || true
+            echo "17. Final service status..."
+
+            docker compose -f "$COMPOSE_FILE" ps
+
+            echo ""
+            echo "Deployment commit:"
+            git log -1 --format='%h %s'
 
             echo ""
             echo "=========================================="
-            echo "Laravel API deployment completed successfully."
+            echo "Deployment completed."
+            echo "Note: Sanctum cookie behavior must also be"
+            echo "verified independently before sign-off."
             echo "=========================================="
 
             trap - EXIT

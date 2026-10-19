@@ -1,12 +1,20 @@
+# syntax=docker/dockerfile:1
+
 FROM php:8.3-fpm
 
-# ============================================================
-# System dependencies and PHP extensions
-# ============================================================
+ENV APP_ENV=production \
+    PHP_OPCACHE_VALIDATE_TIMESTAMPS=0
+
+WORKDIR /var/www
+
+# ------------------------------------------------------------
+# System packages and PHP extensions
+# ------------------------------------------------------------
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git \
+        ca-certificates \
         curl \
+        git \
         unzip \
         libpng-dev \
         libonig-dev \
@@ -23,23 +31,18 @@ RUN apt-get update \
         gd \
         zip \
         calendar \
+        opcache \
     && pecl install redis \
     && docker-php-ext-enable redis \
     && rm -rf /var/lib/apt/lists/* /tmp/pear
 
-# ============================================================
+# ------------------------------------------------------------
 # Composer
-# ============================================================
-COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+# ------------------------------------------------------------
+COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
 
-# ============================================================
-# Application directory
-# ============================================================
-WORKDIR /var/www
-
-# ============================================================
-# Install production dependencies
-# ============================================================
+# Install production dependencies before copying application code
+# to improve Docker layer caching.
 COPY composer.json composer.lock ./
 
 RUN composer install \
@@ -50,19 +53,19 @@ RUN composer install \
     --no-progress \
     --no-scripts
 
-# ============================================================
+# ------------------------------------------------------------
 # Application source
-# ============================================================
+# ------------------------------------------------------------
 COPY . .
 
-# ============================================================
-# PHP configuration
-# ============================================================
+# ------------------------------------------------------------
+# PHP production configuration
+# ------------------------------------------------------------
 COPY docker/php/custom.ini /usr/local/etc/php/conf.d/99-custom.ini
 
-# ============================================================
-# Laravel runtime directories and permissions
-# ============================================================
+# ------------------------------------------------------------
+# Laravel writable directories
+# ------------------------------------------------------------
 RUN mkdir -p \
         storage/app/private \
         storage/app/public \
@@ -72,12 +75,11 @@ RUN mkdir -p \
         storage/logs \
         bootstrap/cache \
     && chown -R www-data:www-data storage bootstrap/cache \
-    && chmod -R ug+rwX storage bootstrap/cache
+    && chmod -R ug+rwX storage bootstrap/cache \
+    && php -v \
+    && php -m
 
-# ============================================================
-# PHP-FPM
-# Accessible internally through the Docker network.
-# ============================================================
+# PHP-FPM is accessible only through the internal Docker network.
 EXPOSE 9000
 
 CMD ["php-fpm"]
