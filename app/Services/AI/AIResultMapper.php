@@ -4,12 +4,17 @@ declare(strict_types=1);
 
 namespace App\Services\AI;
 
+use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
+use Throwable;
 
 class AIResultMapper
 {
     /**
      * Map the complete AI batch response into a Laravel-friendly structure.
+     *
+     * Topic and priority are optional AI-generated classifications.
+     * Their labels are not restricted to a predefined vocabulary.
      *
      * @param array<string, mixed> $response
      * @return array<int, array<string, mixed>>
@@ -20,25 +25,126 @@ class AIResultMapper
     {
         $results = $response['results'] ?? null;
 
+        Log::debug('AIResultMapper | Incoming batch response.', [
+            'has_results' => array_key_exists('results', $response),
+            'response_keys' => array_keys($response),
+            'results_type' => get_debug_type($results),
+            'result_count' => is_array($results)
+                ? count($results)
+                : null,
+            'response' => $this->shouldLogPayload()
+                ? $response
+                : null,
+        ]);
+
         if (!is_array($results)) {
+            Log::error('AIResultMapper | Invalid batch response.', [
+                'response_keys' => array_keys($response),
+                'results_type' => get_debug_type($results),
+            ]);
+
             throw new InvalidArgumentException(
                 'AI response is missing a valid results array.'
             );
         }
 
-        return array_map(
-            function (mixed $result, int $index): array {
-                if (!is_array($result)) {
-                    throw new InvalidArgumentException(
-                        "AI result at index {$index} must be an array."
-                    );
-                }
+        $mapped = [];
 
-                return $this->mapResult($result, $index);
-            },
-            $results,
-            array_keys($results),
-        );
+        foreach ($results as $index => $result) {
+            if (!is_array($result)) {
+                Log::error(
+                    'AIResultMapper | Invalid result structure.',
+                    [
+                        'index' => $index,
+                        'result_type' => get_debug_type($result),
+                        'result' => $this->shouldLogPayload()
+                            ? $result
+                            : null,
+                    ]
+                );
+
+                throw new InvalidArgumentException(
+                    sprintf(
+                        'AI result at index %s must be an array.',
+                        (string) $index,
+                    )
+                );
+            }
+
+            Log::debug(
+                'AIResultMapper | Processing incoming result.',
+                [
+                    'index' => $index,
+                    'external_id' => $result['id'] ?? null,
+                    'available_fields' => array_keys($result),
+                    'language_type' => get_debug_type(
+                        $result['language'] ?? null
+                    ),
+                    'sentiment_type' => get_debug_type(
+                        $result['sentiment'] ?? null
+                    ),
+                    'topic_type' => get_debug_type(
+                        $result['topic'] ?? null
+                    ),
+                    'topic' => $this->shouldLogPayload()
+                        ? ($result['topic'] ?? null)
+                        : null,
+                    'priority_type' => get_debug_type(
+                        $result['priority'] ?? null
+                    ),
+                    'priority' => $this->shouldLogPayload()
+                        ? ($result['priority'] ?? null)
+                        : null,
+                ]
+            );
+
+            try {
+                $mapped[] = $this->mapResult(
+                    $result,
+                    (int) $index,
+                );
+            } catch (InvalidArgumentException $exception) {
+                Log::error(
+                    'AIResultMapper | Failed to map AI result.',
+                    [
+                        'index' => $index,
+                        'external_id' => $result['id'] ?? null,
+                        'available_fields' => array_keys($result),
+                        'topic_type' => get_debug_type(
+                            $result['topic'] ?? null
+                        ),
+                        'priority_type' => get_debug_type(
+                            $result['priority'] ?? null
+                        ),
+                        'result' => $this->shouldLogPayload()
+                            ? $result
+                            : null,
+                        'exception_message' => $exception->getMessage(),
+                    ]
+                );
+
+                throw $exception;
+            } catch (Throwable $exception) {
+                Log::error(
+                    'AIResultMapper | Unexpected mapping error.',
+                    [
+                        'index' => $index,
+                        'external_id' => $result['id'] ?? null,
+                        'exception_class' => $exception::class,
+                        'exception_message' => $exception->getMessage(),
+                    ]
+                );
+
+                throw $exception;
+            }
+        }
+
+        Log::debug('AIResultMapper | Batch mapping completed.', [
+            'received_count' => count($results),
+            'mapped_count' => count($mapped),
+        ]);
+
+        return $mapped;
     }
 
     /**
@@ -56,22 +162,22 @@ class AIResultMapper
         $id = $this->requiredString(
             $result,
             'id',
-            "AI result at index {$index}"
+            "AI result at index {$index}",
         );
 
         $language = $this->requiredArray(
             $result,
             'language',
-            "AI result '{$id}'"
+            "AI result '{$id}'",
         );
 
         $sentiment = $this->requiredArray(
             $result,
             'sentiment',
-            "AI result '{$id}'"
+            "AI result '{$id}'",
         );
 
-        $mapped = [
+        return [
             'external_id' => $id,
 
             /*
@@ -80,13 +186,13 @@ class AIResultMapper
             'language_code' => $this->requiredString(
                 $language,
                 'code',
-                "AI language result for '{$id}'"
+                "AI language result for '{$id}'",
             ),
 
             'language_confidence' => $this->confidence(
                 $language,
                 'confidence',
-                "AI language result for '{$id}'"
+                "AI language result for '{$id}'",
             ),
 
             /*
@@ -95,7 +201,7 @@ class AIResultMapper
             'sentiment_label' => $this->requiredString(
                 $sentiment,
                 'label',
-                "AI sentiment result for '{$id}'"
+                "AI sentiment result for '{$id}'",
             ),
 
             'sentiment_label_id' => $this->optionalInteger(
@@ -106,81 +212,46 @@ class AIResultMapper
             'sentiment_confidence' => $this->confidence(
                 $sentiment,
                 'confidence',
-                "AI sentiment result for '{$id}'"
+                "AI sentiment result for '{$id}'",
             ),
 
             /*
              * Topic
              *
-             * Optional until TopicService is finalized.
+             * Accepts a string or an object containing "label".
+             * The topic vocabulary is not restricted.
+             * Missing or malformed optional confidence becomes null.
              */
-            'topic_label' => null,
-            'topic_confidence' => null,
+            'topic_label' => $this->optionalLabel(
+                $result['topic'] ?? null,
+            ),
+
+            'topic_confidence' => $this->optionalConfidence(
+                $result['topic'] ?? null,
+            ),
 
             /*
              * Priority
              *
-             * Optional until PriorityService is finalized.
+             * Accepts a string or an object containing "label".
+             * The priority vocabulary is not restricted.
              */
-            'priority_label' => null,
-            'priority_confidence' => null,
+            'priority_label' => $this->optionalLabel(
+                $result['priority'] ?? null,
+            ),
+
+            'priority_confidence' => $this->optionalConfidence(
+                $result['priority'] ?? null,
+            ),
         ];
-
-        /*
-         * Topic
-         */
-        if (isset($result['topic'])) {
-            $topic = $this->optionalArray(
-                $result['topic'],
-                "AI topic result for '{$id}'"
-            );
-
-            if ($topic !== null) {
-                $mapped['topic_label'] = $this->requiredString(
-                    $topic,
-                    'label',
-                    "AI topic result for '{$id}'"
-                );
-
-                $mapped['topic_confidence'] = $this->confidence(
-                    $topic,
-                    'confidence',
-                    "AI topic result for '{$id}'"
-                );
-            }
-        }
-
-        /*
-         * Priority
-         */
-        if (isset($result['priority'])) {
-            $priority = $this->optionalArray(
-                $result['priority'],
-                "AI priority result for '{$id}'"
-            );
-
-            if ($priority !== null) {
-                $mapped['priority_label'] = $this->requiredString(
-                    $priority,
-                    'label',
-                    "AI priority result for '{$id}'"
-                );
-
-                $mapped['priority_confidence'] = $this->confidence(
-                    $priority,
-                    'confidence',
-                    "AI priority result for '{$id}'"
-                );
-            }
-        }
-
-        return $mapped;
     }
 
     /**
-     * Extract a required string value.
+     * Extract a required non-empty string.
      *
      * @param array<string, mixed> $data
+     *
+     * @throws InvalidArgumentException
      */
     private function requiredString(
         array $data,
@@ -205,10 +276,12 @@ class AIResultMapper
     }
 
     /**
-     * Extract a required array.
+     * Extract a required object represented as an associative array.
      *
      * @param array<string, mixed> $data
      * @return array<string, mixed>
+     *
+     * @throws InvalidArgumentException
      */
     private function requiredArray(
         array $data,
@@ -233,30 +306,79 @@ class AIResultMapper
     }
 
     /**
-     * Extract an optional array.
+     * Extract an optional classification label.
      *
-     * @param mixed $value
-     * @return array<string, mixed>|null
+     * Supported examples:
+     * - "roads_infrastructure"
+     * - ["label" => "roads_infrastructure", "confidence" => 0.95]
+     * - null
+     *
+     * @return string|null
      */
-    private function optionalArray(
-        mixed $value,
-        string $context,
-    ): ?array {
-        if (!is_array($value)) {
-            throw new InvalidArgumentException(
-                "{$context} must be an object."
-            );
+    private function optionalLabel(mixed $value): ?string
+    {
+        if (is_string($value)) {
+            $label = trim($value);
+
+            return $label !== '' ? $label : null;
         }
 
-        return $value;
+        if (!is_array($value)) {
+            return null;
+        }
+
+        $label = $value['label'] ?? null;
+
+        if (!is_string($label)) {
+            return null;
+        }
+
+        $label = trim($label);
+
+        return $label !== '' ? $label : null;
     }
 
     /**
-     * Extract and validate a confidence score.
+     * Extract optional confidence from a classification.
      *
-     * Confidence must be between 0 and 1.
+     * Invalid or missing optional confidence values become null.
+     */
+    private function optionalConfidence(mixed $value): ?float
+    {
+        if (!is_array($value)) {
+            return null;
+        }
+
+        if (!array_key_exists('confidence', $value)) {
+            return null;
+        }
+
+        $confidence = $value['confidence'];
+
+        if (
+            !is_numeric($confidence)
+            || !is_finite((float) $confidence)
+        ) {
+            return null;
+        }
+
+        $confidence = (float) $confidence;
+
+        if ($confidence < 0.0 || $confidence > 1.0) {
+            return null;
+        }
+
+        return $confidence;
+    }
+
+    /**
+     * Extract and validate required confidence.
+     *
+     * Confidence must be numeric and between 0 and 1.
      *
      * @param array<string, mixed> $data
+     *
+     * @throws InvalidArgumentException
      */
     private function confidence(
         array $data,
@@ -279,7 +401,11 @@ class AIResultMapper
 
         $confidence = (float) $value;
 
-        if ($confidence < 0.0 || $confidence > 1.0) {
+        if (
+            !is_finite($confidence)
+            || $confidence < 0.0
+            || $confidence > 1.0
+        ) {
             throw new InvalidArgumentException(
                 "{$context} field '{$key}' must be between 0 and 1."
             );
@@ -314,12 +440,27 @@ class AIResultMapper
             return (int) $value;
         }
 
-        if (is_float($value) && floor($value) === $value) {
+        if (
+            is_float($value)
+            && is_finite($value)
+            && floor($value) === $value
+        ) {
             return (int) $value;
         }
 
         throw new InvalidArgumentException(
             "AI field '{$key}' must be an integer."
         );
+    }
+
+    /**
+     * Determine whether full incoming payloads should be logged.
+     *
+     * Keep AI_LOG_PAYLOADS disabled in production unless temporarily
+     * needed for debugging.
+     */
+    private function shouldLogPayload(): bool
+    {
+        return (bool) config('services.ai.log_payloads', false);
     }
 }
