@@ -13,8 +13,8 @@ class AIResultMapper
     /**
      * Map the complete AI batch response into a Laravel-friendly structure.
      *
-     * Topic and priority labels are optional and are not restricted to
-     * a predefined vocabulary.
+     * Logs the actual classification response fields for debugging without
+     * logging the complete batch payload or comment messages.
      *
      * @param array<string, mixed> $response
      * @return array<int, array<string, mixed>>
@@ -25,8 +25,6 @@ class AIResultMapper
     {
         $results = $response['results'] ?? null;
 
-        $logPayload = $this->shouldLogPayload();
-
         Log::debug('AIResultMapper | Incoming batch response.', [
             'has_results' => array_key_exists('results', $response),
             'response_keys' => array_keys($response),
@@ -34,7 +32,6 @@ class AIResultMapper
             'result_count' => is_array($results)
                 ? count($results)
                 : null,
-            'response' => $logPayload ? $response : null,
         ]);
 
         if (!is_array($results)) {
@@ -48,6 +45,90 @@ class AIResultMapper
             );
         }
 
+        /*
+         * Inspect the actual AI response without logging comment messages.
+         *
+         * This log is independent of AI_LOG_PAYLOADS.
+         */
+        foreach ($results as $index => $result) {
+            if (!is_array($result)) {
+                continue;
+            }
+
+            $language = is_array($result['language'] ?? null)
+                ? $result['language']
+                : [];
+
+            $sentiment = is_array($result['sentiment'] ?? null)
+                ? $result['sentiment']
+                : [];
+
+            $scores = is_array($sentiment['scores'] ?? null)
+                ? $sentiment['scores']
+                : null;
+
+            Log::info(
+                'AIResultMapper | Actual AI result inspection.',
+                [
+                    'index' => $index,
+                    'external_id' => $result['id'] ?? null,
+                    'result_fields' => array_keys($result),
+
+                    /*
+                     * Actual language output
+                     */
+                    'language' => [
+                        'type' => get_debug_type(
+                            $result['language'] ?? null
+                        ),
+                        'code' => $language['code'] ?? null,
+                        'confidence' => $language['confidence'] ?? null,
+                    ],
+
+                    /*
+                     * Actual sentiment output, including probabilities
+                     */
+                    'sentiment' => [
+                        'type' => get_debug_type(
+                            $result['sentiment'] ?? null
+                        ),
+                        'label' => $sentiment['label'] ?? null,
+                        'label_id' => $sentiment['label_id'] ?? null,
+                        'confidence' => $sentiment['confidence'] ?? null,
+                        'scores' => $scores,
+                        'scores_type' => get_debug_type(
+                            $sentiment['scores'] ?? null
+                        ),
+                    ],
+
+                    /*
+                     * Actual optional classification output
+                     */
+                    'topic' => $result['topic'] ?? null,
+                    'topic_type' => get_debug_type(
+                        $result['topic'] ?? null
+                    ),
+
+                    'priority' => $result['priority'] ?? null,
+                    'priority_type' => get_debug_type(
+                        $result['priority'] ?? null
+                    ),
+
+                    /*
+                     * Processing and model metadata, when supplied
+                     */
+                    'processing_time_ms' =>
+                        $result['processing_time_ms'] ?? null,
+
+                    'model_version' =>
+                        $result['model_version'] ?? null,
+
+                    'model_version_id' =>
+                        $result['model_version_id'] ?? null,
+                ]
+            );
+        }
+
         $mapped = [];
 
         foreach ($results as $index => $result) {
@@ -57,7 +138,6 @@ class AIResultMapper
                     [
                         'index' => $index,
                         'result_type' => get_debug_type($result),
-                        'result' => $logPayload ? $result : null,
                     ]
                 );
 
@@ -68,48 +148,6 @@ class AIResultMapper
                     )
                 );
             }
-
-            Log::debug(
-                'AIResultMapper | Processing incoming result.',
-                [
-                    'index' => $index,
-                    'external_id' => $result['id'] ?? null,
-                    'available_fields' => array_keys($result),
-
-                    'language_type' => get_debug_type(
-                        $result['language'] ?? null
-                    ),
-
-                    'sentiment_type' => get_debug_type(
-                        $result['sentiment'] ?? null
-                    ),
-
-                    'topic_type' => get_debug_type(
-                        $result['topic'] ?? null
-                    ),
-
-                    'priority_type' => get_debug_type(
-                        $result['priority'] ?? null
-                    ),
-
-                    'sentiment_scores_type' => get_debug_type(
-                        is_array($result['sentiment'] ?? null)
-                            ? ($result['sentiment']['scores'] ?? null)
-                            : null
-                    ),
-
-                    'processing_time_ms' =>
-                        $result['processing_time_ms'] ?? null,
-
-                    'topic' => $logPayload
-                        ? ($result['topic'] ?? null)
-                        : null,
-
-                    'priority' => $logPayload
-                        ? ($result['priority'] ?? null)
-                        : null,
-                ]
-            );
 
             try {
                 $mappedResult = $this->mapResult(
@@ -124,12 +162,19 @@ class AIResultMapper
                     [
                         'index' => $index,
                         'external_id' => $mappedResult['external_id'],
+                        'language_code' => $mappedResult['language_code'],
+                        'sentiment_label' => $mappedResult['sentiment_label'],
+                        'sentiment_confidence' =>
+                            $mappedResult['sentiment_confidence'],
 
-                        'language_code' =>
-                            $mappedResult['language_code'],
+                        'positive_score' =>
+                            $mappedResult['positive_score'],
 
-                        'sentiment_label' =>
-                            $mappedResult['sentiment_label'],
+                        'neutral_score' =>
+                            $mappedResult['neutral_score'],
+
+                        'negative_score' =>
+                            $mappedResult['negative_score'],
 
                         'has_sentiment_scores' =>
                             $mappedResult['positive_score'] !== null
@@ -137,13 +182,10 @@ class AIResultMapper
                             && $mappedResult['negative_score'] !== null,
 
                         'topic_label' => $mappedResult['topic_label'],
-
                         'topic_confidence' =>
                             $mappedResult['topic_confidence'],
 
-                        'priority_label' =>
-                            $mappedResult['priority_label'],
-
+                        'priority_label' => $mappedResult['priority_label'],
                         'priority_confidence' =>
                             $mappedResult['priority_confidence'],
 
@@ -158,17 +200,12 @@ class AIResultMapper
                         'index' => $index,
                         'external_id' => $result['id'] ?? null,
                         'available_fields' => array_keys($result),
-
                         'topic_type' => get_debug_type(
                             $result['topic'] ?? null
                         ),
-
                         'priority_type' => get_debug_type(
                             $result['priority'] ?? null
                         ),
-
-                        'result' => $logPayload ? $result : null,
-
                         'exception_message' => $exception->getMessage(),
                     ]
                 );
@@ -199,21 +236,6 @@ class AIResultMapper
 
     /**
      * Map a single AI result.
-     *
-     * Expected classification structure:
-     *
-     * [
-     *     'topic' => [
-     *         'label' => 'roads_infrastructure',
-     *         'confidence' => 0.95,
-     *     ],
-     *     'priority' => [
-     *         'label' => 'high',
-     *         'confidence' => 0.88,
-     *     ],
-     * ]
-     *
-     * Topic and priority can also be plain strings.
      *
      * @param array<string, mixed> $result
      * @return array<string, mixed>
@@ -247,9 +269,6 @@ class AIResultMapper
             : [];
 
         return [
-            /*
-             * External identity
-             */
             'external_id' => $id,
 
             /*
@@ -268,7 +287,7 @@ class AIResultMapper
             ),
 
             /*
-             * Sentiment classification
+             * Sentiment
              */
             'sentiment_label' => $this->requiredString(
                 $sentiment,
@@ -289,8 +308,6 @@ class AIResultMapper
 
             /*
              * Sentiment probability scores
-             *
-             * Missing or invalid optional scores become null.
              */
             'positive_score' => $this->optionalScore(
                 $scores,
@@ -308,10 +325,7 @@ class AIResultMapper
             ),
 
             /*
-             * Topic classification
-             *
-             * Supports a string or an object containing label and
-             * confidence. Labels are not restricted to fixed values.
+             * Topic
              */
             'topic_label' => $this->optionalLabel(
                 $result['topic'] ?? null,
@@ -322,7 +336,7 @@ class AIResultMapper
             ),
 
             /*
-             * Priority classification
+             * Priority
              */
             'priority_label' => $this->optionalLabel(
                 $result['priority'] ?? null,
@@ -334,8 +348,6 @@ class AIResultMapper
 
             /*
              * Processing metadata
-             *
-             * The AI service must return this field for it to be mapped.
              */
             'processing_time_ms' => $this->optionalInteger(
                 $result,
@@ -406,10 +418,7 @@ class AIResultMapper
     /**
      * Extract an optional classification label.
      *
-     * Supported values:
-     * - "roads_infrastructure"
-     * - ["label" => "roads_infrastructure", "confidence" => 0.95]
-     * - null
+     * Accepts a string or an array containing a label.
      */
     private function optionalLabel(mixed $value): ?string
     {
@@ -435,17 +444,14 @@ class AIResultMapper
     }
 
     /**
-     * Extract optional confidence from a classification.
-     *
-     * Invalid or missing optional confidence values become null.
+     * Extract optional classification confidence.
      */
     private function optionalConfidence(mixed $value): ?float
     {
-        if (!is_array($value)) {
-            return null;
-        }
-
-        if (!array_key_exists('confidence', $value)) {
+        if (
+            !is_array($value)
+            || !array_key_exists('confidence', $value)
+        ) {
             return null;
         }
 
@@ -469,8 +475,6 @@ class AIResultMapper
 
     /**
      * Extract an optional probability score.
-     *
-     * Valid values must be numeric and between 0 and 1.
      *
      * @param array<string, mixed> $scores
      */
@@ -502,8 +506,6 @@ class AIResultMapper
 
     /**
      * Extract and validate required confidence.
-     *
-     * Confidence must be numeric and between 0 and 1.
      *
      * @param array<string, mixed> $data
      *
@@ -546,9 +548,6 @@ class AIResultMapper
     /**
      * Extract an optional integer.
      *
-     * Missing values become null. Present but invalid values throw an
-     * exception so malformed processing metadata is not silently accepted.
-     *
      * @param array<string, mixed> $data
      *
      * @throws InvalidArgumentException
@@ -585,16 +584,5 @@ class AIResultMapper
         throw new InvalidArgumentException(
             "AI field '{$key}' must be an integer."
         );
-    }
-
-    /**
-     * Determine whether full incoming payloads should be logged.
-     *
-     * Keep AI_LOG_PAYLOADS disabled in production unless temporarily
-     * needed for debugging. AI payloads may contain user-generated content.
-     */
-    private function shouldLogPayload(): bool
-    {
-        return (bool) config('services.ai.log_payloads', false);
     }
 }
