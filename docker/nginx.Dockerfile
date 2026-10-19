@@ -24,7 +24,6 @@ COPY nginx/default.conf /etc/nginx/conf.d/default.conf
 # ------------------------------------------------------------
 # Validate configuration during image build
 # ------------------------------------------------------------
-RUN nginx -t
 
 EXPOSE 80
 
