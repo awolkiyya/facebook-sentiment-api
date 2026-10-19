@@ -133,11 +133,24 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=traefik-public"
+
+      # Existing HTTP router
       - "traefik.http.routers.facebook-sentiment-api.rule=Host(`196.190.216.57`) && (PathPrefix(`/api`) || PathPrefix(`/sanctum`))"
       - "traefik.http.routers.facebook-sentiment-api.entrypoints=web"
       - "traefik.http.routers.facebook-sentiment-api.priority=100"
       - "traefik.http.routers.facebook-sentiment-api.service=facebook-sentiment-api"
+
+      # New HTTPS router
+      - "traefik.http.routers.facebook-sentiment-api-secure.rule=Host(`196.190.216.57`) && (PathPrefix(`/api`) || PathPrefix(`/sanctum`))"
+      - "traefik.http.routers.facebook-sentiment-api-secure.entrypoints=websecure"
+      - "traefik.http.routers.facebook-sentiment-api-secure.priority=100"
+      - "traefik.http.routers.facebook-sentiment-api-secure.service=facebook-sentiment-api"
+      - "traefik.http.routers.facebook-sentiment-api-secure.tls=true"
+      - "traefik.http.routers.facebook-sentiment-api-secure.tls.certresolver=le"
+
+      # Shared backend service
       - "traefik.http.services.facebook-sentiment-api.loadbalancer.server.port=80"
+
     volumes:
       - storage:/var/www/storage:ro
     depends_on:
