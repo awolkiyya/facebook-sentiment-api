@@ -9,32 +9,18 @@ use App\Services\Http\HttpClientService;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
+use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use Throwable;
 
 class AIClient
 {
-    /**
-     * Absolute safety limit for one request to the AI service.
-     *
-     * This prevents the application from ever sending an excessively
-     * large batch, even if the system setting is misconfigured.
-     */
     private const MAX_BATCH_SIZE = 500;
 
-    /**
-     * Default batch size used when the system setting is invalid.
-     */
     private const DEFAULT_BATCH_SIZE = 32;
 
-    /**
-     * Maximum text length accepted for one item.
-     */
     private const MAX_TEXT_LENGTH = 10_000;
 
-    /**
-     * Default HTTP timeout in seconds.
-     */
     private const DEFAULT_TIMEOUT = 30;
 
     public function __construct(
@@ -45,12 +31,7 @@ class AIClient
     /**
      * Analyze multiple texts using the Python AI service.
      *
-     * The configured ai_batch_size from system settings is used as the
-     * operational batch limit. MAX_BATCH_SIZE remains the absolute safety
-     * ceiling.
-     *
      * @param array<int, array{id: string, text: string}> $items
-     *
      * @return array<string, mixed>
      *
      * @throws AIException
@@ -81,9 +62,30 @@ class AIClient
                 timeout: $timeout,
             );
 
+            /*
+             * Log the AI response before validation.
+             *
+             * Do not log the request payload because it contains
+             * Facebook comment text.
+             */
+            Log::debug('AI service batch response received.', [
+                'endpoint' => $endpoint,
+                'http_status' => $response->status(),
+                'successful' => $response->successful(),
+                'response_body' => $this->getSafeResponseBody(
+                    $response,
+                ),
+            ]);
+
             return $this->validateResponse($response);
 
         } catch (ConnectionException $exception) {
+            Log::error('Unable to connect to the AI service.', [
+                'endpoint' => $endpoint,
+                'exception_class' => $exception::class,
+                'exception_message' => $exception->getMessage(),
+            ]);
+
             throw new AIException(
                 message: 'Unable to connect to the AI service.',
                 code: 0,
@@ -91,6 +93,13 @@ class AIClient
             );
 
         } catch (RequestException $exception) {
+            Log::error('AI service returned an HTTP error.', [
+                'endpoint' => $endpoint,
+                'http_status' => $exception->response?->status(),
+                'exception_class' => $exception::class,
+                'exception_message' => $exception->getMessage(),
+            ]);
+
             throw new AIException(
                 message: $this->getRequestErrorMessage($exception),
                 code: $exception->response?->status() ?? 0,
@@ -98,9 +107,20 @@ class AIClient
             );
 
         } catch (AIException $exception) {
+            Log::warning('AI service response validation failed.', [
+                'endpoint' => $endpoint,
+                'exception_message' => $exception->getMessage(),
+            ]);
+
             throw $exception;
 
         } catch (Throwable $exception) {
+            Log::error('Unexpected AI service request failure.', [
+                'endpoint' => $endpoint,
+                'exception_class' => $exception::class,
+                'exception_message' => $exception->getMessage(),
+            ]);
+
             throw new AIException(
                 message: 'AI service request failed.',
                 code: 0,
@@ -110,9 +130,7 @@ class AIClient
     }
 
     /**
-     * Analyze a single text.
-     *
-     * Internally uses the batch endpoint.
+     * Return a single-text analysis using the batch endpoint.
      *
      * @return array<string, mixed>
      *
@@ -132,10 +150,6 @@ class AIClient
 
     /**
      * Get the configured AI batch size.
-     *
-     * The value comes from system_settings.ai_batch_size.
-     *
-     * The configured value can never exceed MAX_BATCH_SIZE.
      *
      * @throws AIException
      */
@@ -196,17 +210,9 @@ class AIClient
             );
         }
 
-        $baseUrl = rtrim(
-            trim($baseUrl),
-            '/'
-        );
+        $baseUrl = rtrim(trim($baseUrl), '/');
 
-        if (
-            !filter_var(
-                $baseUrl,
-                FILTER_VALIDATE_URL
-            )
-        ) {
+        if (!filter_var($baseUrl, FILTER_VALIDATE_URL)) {
             throw new AIException(
                 'AI service URL is invalid.'
             );
@@ -278,8 +284,6 @@ class AIClient
 
     /**
      * Validate batch input before sending it to Python.
-     *
-     * The configured ai_batch_size is enforced here.
      *
      * @param array<int, array{id: string, text: string}> $items
      *
@@ -357,30 +361,62 @@ class AIClient
     }
 
     /**
+     * Log-safe response representation.
+     *
+     * The response is decoded as JSON when possible. For non-JSON
+     * responses, only the HTTP status and response type are logged.
+     *
+     * @return array<string, mixed>
+     */
+    private function getSafeResponseBody(
+        Response $response,
+    ): array {
+        $payload = $response->json();
+
+        if (!is_array($payload)) {
+            return [
+                'format' => 'non_json',
+                'body_length' => strlen($response->body()),
+            ];
+        }
+
+        /*
+         * The AI result contains predictions and metadata rather than
+         * the original comment text. Log only these returned fields.
+         */
+        $results = [];
+
+        foreach (($payload['results'] ?? []) as $index => $result) {
+            if (!is_array($result)) {
+                $results[] = [
+                    'index' => $index,
+                    'result_type' => get_debug_type($result),
+                ];
+
+                continue;
+            }
+
+            $results[] = [
+                'id' => $result['id'] ?? null,
+                'language' => $result['language'] ?? null,
+                'sentiment' => $result['sentiment'] ?? null,
+                'topic' => $result['topic'] ?? null,
+                'priority' => $result['priority'] ?? null,
+            ];
+        }
+
+        return [
+            'results' => $results,
+            'model' => $payload['model'] ?? null,
+            'additional_fields' => array_diff(
+                array_keys($payload),
+                ['results', 'model'],
+            ),
+        ];
+    }
+
+    /**
      * Validate the Python AI response.
-     *
-     * Expected structure:
-     *
-     * {
-     *     "results": [
-     *         {
-     *             "id": "comment-001",
-     *             "language": {
-     *                 "code": "en",
-     *                 "confidence": 0.99
-     *             },
-     *             "sentiment": {
-     *                 "label": "positive",
-     *                 "label_id": 2,
-     *                 "confidence": 0.98
-     *             }
-     *         }
-     *     ],
-     *     "model": {
-     *         "language": "1.0.0",
-     *         "sentiment": "1.0.0"
-     *     }
-     * }
      *
      * @return array<string, mixed>
      *
@@ -415,14 +451,8 @@ class AIClient
             );
         }
 
-        foreach (
-            $payload['results']
-            as $index => $result
-        ) {
-            $this->validateResult(
-                $result,
-                $index,
-            );
+        foreach ($payload['results'] as $index => $result) {
+            $this->validateResult($result, $index);
         }
 
         return $payload;
@@ -430,8 +460,6 @@ class AIClient
 
     /**
      * Validate one AI result.
-     *
-     * @param mixed $result
      *
      * @throws AIException
      */
@@ -448,9 +476,6 @@ class AIClient
             );
         }
 
-        /*
-         * ID
-         */
         if (
             !array_key_exists('id', $result)
             || !is_string($result['id'])
@@ -464,27 +489,14 @@ class AIClient
             );
         }
 
-        /*
-         * Language
-         */
-        $this->validateLanguage(
-            $result,
-            $index,
-        );
+        $this->validateLanguage($result, $index);
+
+        $this->validateSentiment($result, $index);
 
         /*
-         * Sentiment
-         */
-        $this->validateSentiment(
-            $result,
-            $index,
-        );
-
-        /*
-         * Topic
-         *
-         * Optional until the Python TopicService
-         * is finalized.
+         * Topic and priority are produced by the AI service.
+         * Their labels are not restricted to a predefined list.
+         * Basic structure validation is retained when they exist.
          */
         if (array_key_exists('topic', $result)) {
             $this->validateAnalysisPart(
@@ -494,12 +506,6 @@ class AIClient
             );
         }
 
-        /*
-         * Priority
-         *
-         * Optional until the Python PriorityService
-         * is finalized.
-         */
         if (array_key_exists('priority', $result)) {
             $this->validateAnalysisPart(
                 $result['priority'],
@@ -511,8 +517,6 @@ class AIClient
 
     /**
      * Validate language result.
-     *
-     * Language uses "code", not "label".
      *
      * @param array<string, mixed> $result
      *
@@ -549,19 +553,9 @@ class AIClient
             );
         }
 
-        $allowedLanguages = [
-            'am',
-            'om',
-            'en',
-        ];
+        $allowedLanguages = ['am', 'om', 'en'];
 
-        if (
-            !in_array(
-                $language['code'],
-                $allowedLanguages,
-                true,
-            )
-        ) {
+        if (!in_array($language['code'], $allowedLanguages, true)) {
             throw new AIException(
                 sprintf(
                     'AI service result at index %s returned unsupported language code "%s".',
@@ -622,13 +616,7 @@ class AIClient
             'positive',
         ];
 
-        if (
-            !in_array(
-                $sentiment['label'],
-                $allowedSentiments,
-                true,
-            )
-        ) {
+        if (!in_array($sentiment['label'], $allowedSentiments, true)) {
             throw new AIException(
                 sprintf(
                     'AI service result at index %s returned unsupported sentiment "%s".',
@@ -652,10 +640,7 @@ class AIClient
 
         $labelId = (int) $sentiment['label_id'];
 
-        if (
-            $labelId < 0
-            || $labelId > 2
-        ) {
+        if ($labelId < 0 || $labelId > 2) {
             throw new AIException(
                 sprintf(
                     'AI service result at index %s has an invalid sentiment label_id.',
@@ -672,7 +657,7 @@ class AIClient
     }
 
     /**
-     * Validate a topic or priority result.
+     * Validate topic or priority structure without restricting labels.
      *
      * @param mixed $analysis
      *
@@ -741,10 +726,7 @@ class AIClient
 
         $confidence = (float) $analysis['confidence'];
 
-        if (
-            $confidence < 0.0
-            || $confidence > 1.0
-        ) {
+        if ($confidence < 0.0 || $confidence > 1.0) {
             throw new AIException(
                 sprintf(
                     'AI service result at index %s has an out-of-range %s confidence.',
