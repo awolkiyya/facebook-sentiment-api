@@ -8,7 +8,7 @@ use App\Models\FacebookComment;
 use App\Models\FacebookSyncRun;
 use App\Modules\SyncRun\Services\FacebookSyncRunService;
 use App\Services\AI\AIException;
-use App\Services\AI\AiOrchestrator;
+use App\Services\AI\AIOrchestrator;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;

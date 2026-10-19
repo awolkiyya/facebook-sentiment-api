@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use Throwable;
 
-class AiOrchestrator
+class AIOrchestrator
 {
     public function __construct(
         private readonly AIClient $aiClient,
