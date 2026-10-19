@@ -22,19 +22,17 @@ final class FacebookSyncDispatcherService
     }
 
     /**
-     * Create a sync run and dispatch the appropriate Facebook job.
+     * Create a synchronization run and dispatch the appropriate job.
      *
      * Page-level synchronization:
-     *
-     *     posts
-     *     full
-     *     incremental
+     * - POSTS
+     * - FULL
+     * - INCREMENTAL
      *
      * Comment synchronization:
+     * - COMMENTS
      *
-     *     comments
-     *
-     * requires post IDs.
+     * Comment synchronization requires valid local Facebook post IDs.
      *
      * @param array<int, string> $postIds
      */
@@ -58,7 +56,7 @@ final class FacebookSyncDispatcherService
 
         /*
         |--------------------------------------------------------------------------
-        | Validate Comment Sync Requirements
+        | Validate Comment Synchronization Requirements
         |--------------------------------------------------------------------------
         */
 
@@ -91,7 +89,7 @@ final class FacebookSyncDispatcherService
 
         /*
         |--------------------------------------------------------------------------
-        | Create Sync Run
+        | Create Synchronization Run
         |--------------------------------------------------------------------------
         */
 
@@ -133,9 +131,15 @@ final class FacebookSyncDispatcherService
                 ],
             );
 
+            /*
+             * IMPORTANT:
+             *
+             * FacebookSyncRun defines facebookPage() and
+             * triggeredByUser(), not page() and triggeredBy().
+             */
             return $run->fresh([
-                'page',
-                'triggeredBy',
+                'facebookPage',
+                'triggeredByUser',
             ]);
         } catch (Throwable $exception) {
             /*
@@ -143,7 +147,7 @@ final class FacebookSyncDispatcherService
             | Dispatch Failure
             |--------------------------------------------------------------------------
             |
-            | Keep the SyncRun record for auditability.
+            | Preserve the run for auditability and record the failure.
             |
             */
 
@@ -237,7 +241,7 @@ final class FacebookSyncDispatcherService
     }
 
     /**
-     * Determine the queue for the root synchronization job.
+     * Determine the queue for the synchronization type.
      */
     private function queueFor(
         FacebookSyncType $type,
@@ -253,6 +257,9 @@ final class FacebookSyncDispatcherService
 
     /**
      * Validate and normalize post IDs for comment synchronization.
+     *
+     * These IDs refer to facebook_posts.id, not the external
+     * Facebook post identifier stored in facebook_post_id.
      *
      * @param array<int, string> $postIds
      * @return array<int, string>
@@ -289,26 +296,17 @@ final class FacebookSyncDispatcherService
 
         /*
         |--------------------------------------------------------------------------
-        | Verify Posts
+        | Verify Posts Belong to the Requested Page
         |--------------------------------------------------------------------------
-        |
-        | IMPORTANT:
-        |
-        | post ID means:
-        |
-        |     facebook_posts.id
-        |
-        | NOT:
-        |
-        |     facebook_posts.facebook_post_id
-        |
         */
 
         $validPostIds = FacebookPost::query()
             ->where('facebook_page_id', $facebookPageId)
             ->whereIn('id', $normalized)
             ->pluck('id')
-            ->map(static fn ($id): string => (string) $id)
+            ->map(
+                static fn ($id): string => (string) $id,
+            )
             ->all();
 
         $validPostIdMap = array_fill_keys(
