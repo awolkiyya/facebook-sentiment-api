@@ -49,6 +49,7 @@ jobs:
 
             APP_DIR="${DEPLOY_PATH:-/opt/asi-platform/apps/facebook-sentiment-api}"
             BACKUP_DIR="/opt/asi-platform/backups/facebook-sentiment-api"
+
             WORKER_STOPPED=0
             DEPLOY_SUCCEEDED=0
 
@@ -65,7 +66,7 @@ jobs:
 
             cd "$APP_DIR"
 
-            # Resolve the Compose file before installing the failure trap.
+            # Resolve Docker Compose configuration.
             if [ -f compose.yaml ]; then
               COMPOSE_FILE="compose.yaml"
             elif [ -f compose.yml ]; then
@@ -83,6 +84,7 @@ jobs:
               docker compose -f "$COMPOSE_FILE" "$@"
             }
 
+            # Report the failing step and preserve service availability.
             on_exit() {
               STATUS=$?
 
@@ -92,20 +94,29 @@ jobs:
                 echo "DEPLOYMENT FAILED: exit code $STATUS"
                 echo "=========================================="
 
+                echo ""
+                echo "--- Container status ---"
                 dc ps || true
 
+                echo ""
+                echo "--- Recent application logs ---"
                 dc logs --tail=100 \
-                  app nginx queue-worker postgres redis 2>/dev/null || true
+                  app nginx queue-worker postgres redis 2>&1 || true
 
-                # Try to restore queue-worker availability if this
-                # workflow stopped it before the failure.
                 if [ "$WORKER_STOPPED" -eq 1 ]; then
-                  echo "Attempting to restart the queue worker..."
-                  dc up -d queue-worker || true
+                  echo ""
+                  echo "--- Recovering queue worker ---"
+
+                  if dc up -d queue-worker; then
+                    echo "Queue worker restart command completed."
+                  else
+                    echo "WARNING: Queue worker restart failed."
+                  fi
                 fi
 
-                echo "Automatic database rollback was not attempted."
-                echo "Inspect the migration state before retrying."
+                echo ""
+                echo "No automatic database rollback was attempted."
+                echo "Inspect migration status before retrying."
               fi
 
               exit "$STATUS"
@@ -130,6 +141,15 @@ jobs:
             fi
 
             chmod 600 .env .env.postgres
+
+            case "${RUN_SEEDERS:-false}" in
+              true|false|"")
+                ;;
+              *)
+                echo "ERROR: RUN_SEEDERS must be true or false."
+                exit 1
+                ;;
+            esac
 
             echo ""
             echo "2. Validating repository state..."
@@ -239,8 +259,7 @@ jobs:
             echo ""
             echo "10. Stopping the queue worker..."
 
-            # Prevent old-code workers from processing jobs during
-            # deployment and schema changes.
+            # Avoid processing jobs with old code during deployment.
             dc stop queue-worker
             WORKER_STOPPED=1
 
@@ -309,6 +328,7 @@ jobs:
 
             BACKUP_FILE="$BACKUP_DIR/adama-civic-intelligence-$(date -u +%Y%m%dT%H%M%SZ).sql"
 
+            # Keep pg_dump output separate from SSH diagnostic output.
             if ! dc exec -T postgres sh -c \
               'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' \
               > "$BACKUP_FILE"; then
@@ -326,11 +346,23 @@ jobs:
             chmod 600 "$BACKUP_FILE"
 
             echo "Database backup created: $BACKUP_FILE"
+            ls -lh "$BACKUP_FILE"
 
             echo ""
             echo "15. Running production migrations..."
 
-            dc exec -T app php artisan migrate --force
+            # Verbose output helps identify the failing migration.
+            if ! dc exec -T app php artisan migrate --force -vvv; then
+              echo "ERROR: Laravel production migrations failed."
+              echo "Current migration status follows."
+
+              dc exec -T app php artisan migrate:status || true
+
+              echo "No automatic database rollback was attempted."
+              exit 1
+            fi
+
+            echo "Production migrations completed."
 
             echo ""
             echo "16. Running optional production seeders..."
@@ -338,14 +370,14 @@ jobs:
             case "${RUN_SEEDERS:-false}" in
               true)
                 echo "Seeder execution explicitly enabled."
-                dc exec -T app php artisan db:seed --force
+
+                if ! dc exec -T app php artisan db:seed --force; then
+                  echo "ERROR: Production database seeders failed."
+                  exit 1
+                fi
                 ;;
               false|"")
                 echo "Skipping seeders."
-                ;;
-              *)
-                echo "ERROR: Invalid RUN_SEEDERS value."
-                exit 1
                 ;;
             esac
 
@@ -384,15 +416,18 @@ jobs:
             echo ""
             echo "19. Testing the Laravel API..."
 
-            API_RESPONSE="$(
+            if ! API_RESPONSE="$(
               dc exec -T nginx wget -q -O - \
                 http://127.0.0.1/api/ping
-            )"
+            )"; then
+              echo "ERROR: API smoke-test request failed."
+              exit 1
+            fi
 
             if ! printf '%s' "$API_RESPONSE" |
               grep -Eq '"success"[[:space:]]*:[[:space:]]*true'; then
-              echo "ERROR: API smoke test failed."
-              echo "Response did not contain the expected success field."
+              echo "ERROR: API smoke test returned an unexpected response."
+              printf '%s\n' "$API_RESPONSE"
               exit 1
             fi
 
@@ -402,7 +437,6 @@ jobs:
             echo "20. Restarting the updated queue worker..."
 
             dc up -d --force-recreate queue-worker
-            WORKER_STOPPED=0
 
             WORKER_CONTAINER="$(dc ps -q queue-worker)"
 
@@ -410,6 +444,8 @@ jobs:
               echo "ERROR: Queue worker container was not created."
               exit 1
             fi
+
+            WORKER_STOPPED=0
 
             WORKER_STATE="$(
               docker inspect \
