@@ -88,7 +88,13 @@ class FacebookComment extends Model
     /**
      * Latest persisted sentiment analysis.
      *
-     * The UUID primary key is not used as an aggregate.
+     * Uses ordered HasOne selection rather than ofMany(),
+     * avoiding MAX() aggregation on UUID primary keys in PostgreSQL.
+     *
+     * Ordering:
+     * 1. Latest analyzed_at, with NULL timestamps last.
+     * 2. Latest created_at.
+     * 3. UUID descending as a deterministic tie-breaker.
      */
     public function latestSentimentAnalysis(): HasOne
     {
@@ -96,9 +102,9 @@ class FacebookComment extends Model
             SentimentAnalysis::class,
             'facebook_comment_id',
             'id',
-        )->ofMany([
-            'analyzed_at' => 'max',
-            'created_at' => 'max',
-        ]);
+        )
+            ->orderByRaw('"analyzed_at" DESC NULLS LAST')
+            ->orderByDesc('created_at')
+            ->orderByDesc('id');
     }
 }
