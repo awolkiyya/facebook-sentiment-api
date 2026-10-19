@@ -293,9 +293,7 @@ public function index(Request $request): JsonResponse
         */
 
         return ApiResponse::success(
-            data: [
-                'comments' => $commentData,
-            ],
+            data:  $commentData,
             message: 'Facebook comments retrieved successfully.',
             meta: [
                 'pagination' => $pagination,
