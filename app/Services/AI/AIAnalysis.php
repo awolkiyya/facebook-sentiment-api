@@ -6,82 +6,68 @@ namespace App\Services\AI;
 
 use App\Models\FacebookComment;
 use App\Models\SentimentAnalysis;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use Throwable;
 
 class AIAnalysis
 {
+    private const ALLOWED_LANGUAGES = [
+        'am',
+        'om',
+        'en',
+    ];
+
+    private const ALLOWED_SENTIMENTS = [
+        'negative',
+        'neutral',
+        'positive',
+    ];
+
     /**
-     * Store an AI analysis result for a Facebook comment.
-     *
-     * Model-version management is intentionally not handled here yet.
+     * Store or update the current analysis for a comment.
      *
      * @param array<string, mixed> $result
-     *
-     * @throws InvalidArgumentException
      */
     public function store(
         FacebookComment $comment,
         array $result,
     ): SentimentAnalysis {
         $this->validateComment($comment);
+        $this->validateResult($result, $comment);
 
-        $this->validateResult(
-            $result,
+        $data = $this->buildAnalysisData($comment, $result);
+
+        return DB::transaction(function () use (
             $comment,
-        );
+            $data,
+        ): SentimentAnalysis {
+            $analysis = SentimentAnalysis::query()
+                ->where('facebook_comment_id', $comment->id)
+                ->lockForUpdate()
+                ->first();
 
-        return DB::transaction(
-            function () use (
-                $comment,
-                $result,
-            ): SentimentAnalysis {
-                /*
-                 * For the current MVP, one Facebook comment has
-                 * one current AI analysis.
-                 *
-                 * Model-version-specific analysis history can be
-                 * introduced later when model version management
-                 * is implemented.
-                 */
-                $analysis = SentimentAnalysis::query()
-                    ->where(
-                        'facebook_comment_id',
-                        $comment->id,
-                    )
-                    ->first();
-
-                $data = $this->buildAnalysisData(
-                    $comment,
-                    $result,
-                );
-
-                if ($analysis === null) {
-                    return SentimentAnalysis::create($data);
-                }
-
-                $analysis->fill($data);
-                $analysis->save();
-
-                return $analysis->refresh();
+            if ($analysis === null) {
+                return SentimentAnalysis::query()->create($data);
             }
-        );
+
+            $analysis->fill($data);
+            $analysis->save();
+
+            return $analysis->refresh();
+        }, 3);
     }
 
     /**
-     * Store multiple AI analysis results.
+     * Store or update a batch of comment analyses.
      *
-     * Results are matched using external_id.
-     *
-     * Model-version management is intentionally not handled here yet.
+     * Every submitted comment must have exactly one corresponding
+     * result, matched by external_id.
      *
      * @param iterable<int, FacebookComment> $comments
      * @param array<int, array<string, mixed>> $results
-     *
      * @return array<int, SentimentAnalysis>
-     *
-     * @throws InvalidArgumentException
      */
     public function storeBatch(
         iterable $comments,
@@ -92,6 +78,12 @@ class AIAnalysis
             : iterator_to_array($comments, false);
 
         if ($comments === []) {
+            if ($results !== []) {
+                throw new InvalidArgumentException(
+                    'AI results were supplied without comments.'
+                );
+            }
+
             return [];
         }
 
@@ -101,12 +93,6 @@ class AIAnalysis
             );
         }
 
-        /*
-         * Index comments by the internal Laravel UUID.
-         *
-         * The UUID is also the correlation ID sent to Python
-         * as external_id/id.
-         */
         $commentsById = [];
 
         foreach ($comments as $index => $comment) {
@@ -122,220 +108,185 @@ class AIAnalysis
 
             if (isset($commentsById[$commentId])) {
                 throw new InvalidArgumentException(
-                    "Duplicate Facebook comment ID '{$commentId}' "
-                    . 'was provided in the batch.'
+                    "Duplicate Facebook comment ID '{$commentId}'."
                 );
             }
 
             $commentsById[$commentId] = $comment;
         }
 
-        /*
-         * Every submitted comment must have exactly one AI result.
-         */
-        if (count($results) !== count($comments)) {
+        if (count($results) !== count($commentsById)) {
             throw new InvalidArgumentException(
                 sprintf(
                     'AI returned %d results for %d comments.',
                     count($results),
-                    count($comments),
+                    count($commentsById),
                 )
             );
         }
 
-        return DB::transaction(
-            function () use (
-                $results,
-                $commentsById,
-            ): array {
-                $analyses = [];
+        /*
+         * Validate and prepare every result before writing anything.
+         */
+        $prepared = [];
+        $seenIds = [];
 
-                /*
-                 * Track processed IDs to prevent duplicate results.
-                 */
-                $processedCommentIds = [];
-
-                foreach ($results as $index => $result) {
-                    if (!is_array($result)) {
-                        throw new InvalidArgumentException(
-                            "AI result at index {$index} must be an array."
-                        );
-                    }
-
-                    $externalId = $result['external_id'] ?? null;
-
-                    if (
-                        !is_string($externalId)
-                        || trim($externalId) === ''
-                    ) {
-                        throw new InvalidArgumentException(
-                            "AI result at index {$index} "
-                            . 'has an invalid external_id.'
-                        );
-                    }
-
-                    $externalId = trim($externalId);
-
-                    /*
-                     * Ensure the result belongs to a submitted comment.
-                     */
-                    if (!isset($commentsById[$externalId])) {
-                        throw new InvalidArgumentException(
-                            "AI result references unknown "
-                            . "Facebook comment '{$externalId}'."
-                        );
-                    }
-
-                    /*
-                     * Prevent duplicate results for the same comment.
-                     */
-                    if (isset($processedCommentIds[$externalId])) {
-                        throw new InvalidArgumentException(
-                            "Duplicate AI result for Facebook comment "
-                            . "'{$externalId}'."
-                        );
-                    }
-
-                    $comment = $commentsById[$externalId];
-
-                    /*
-                     * Validate the complete mapped AI result.
-                     */
-                    $this->validateResult(
-                        $result,
-                        $comment,
-                    );
-
-                    /*
-                     * Build the persistence payload.
-                     */
-                    $data = $this->buildAnalysisData(
-                        $comment,
-                        $result,
-                    );
-
-                    /*
-                     * For the current MVP, locate the current analysis
-                     * only by Facebook comment.
-                     */
-                    $analysis = SentimentAnalysis::query()
-                        ->where(
-                            'facebook_comment_id',
-                            $comment->id,
-                        )
-                        ->first();
-
-                    if ($analysis === null) {
-                        $analysis = SentimentAnalysis::create(
-                            $data,
-                        );
-                    } else {
-                        $analysis->fill($data);
-                        $analysis->save();
-                        $analysis->refresh();
-                    }
-
-                    $analyses[] = $analysis;
-
-                    $processedCommentIds[$externalId] = true;
-                }
-
-                /*
-                 * Verify every submitted comment was processed.
-                 */
-                foreach ($commentsById as $commentId => $_comment) {
-                    if (!isset($processedCommentIds[$commentId])) {
-                        throw new InvalidArgumentException(
-                            "No AI result was persisted for "
-                            . "Facebook comment '{$commentId}'."
-                        );
-                    }
-                }
-
-                return $analyses;
+        foreach ($results as $index => $result) {
+            if (!is_array($result)) {
+                throw new InvalidArgumentException(
+                    "AI result at index {$index} must be an array."
+                );
             }
-        );
+
+            $externalId = $result['external_id'] ?? null;
+
+            if (
+                !is_string($externalId)
+                || trim($externalId) === ''
+            ) {
+                throw new InvalidArgumentException(
+                    "AI result at index {$index} has an invalid external_id."
+                );
+            }
+
+            $externalId = trim($externalId);
+
+            if (!isset($commentsById[$externalId])) {
+                throw new InvalidArgumentException(
+                    "AI result references unknown comment '{$externalId}'."
+                );
+            }
+
+            if (isset($seenIds[$externalId])) {
+                throw new InvalidArgumentException(
+                    "Duplicate AI result for comment '{$externalId}'."
+                );
+            }
+
+            $comment = $commentsById[$externalId];
+
+            $this->validateResult($result, $comment);
+
+            $prepared[$externalId] = [
+                'comment' => $comment,
+                'data' => $this->buildAnalysisData($comment, $result),
+            ];
+
+            $seenIds[$externalId] = true;
+        }
+
+        foreach ($commentsById as $commentId => $_comment) {
+            if (!isset($seenIds[$commentId])) {
+                throw new InvalidArgumentException(
+                    "No AI result was provided for comment '{$commentId}'."
+                );
+            }
+        }
+
+        return DB::transaction(function () use (
+            $prepared,
+            $commentsById,
+        ): array {
+            $analysesById = [];
+
+            /*
+             * Sort IDs to make row-lock acquisition order consistent
+             * across batch requests and reduce deadlock risk.
+             */
+            $ids = array_keys($commentsById);
+            sort($ids, SORT_STRING);
+
+            foreach ($ids as $commentId) {
+                $comment = $prepared[$commentId]['comment'];
+                $data = $prepared[$commentId]['data'];
+
+                $analysis = SentimentAnalysis::query()
+                    ->where('facebook_comment_id', $comment->id)
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($analysis === null) {
+                    $analysis = SentimentAnalysis::query()
+                        ->create($data);
+                } else {
+                    $analysis->fill($data);
+                    $analysis->save();
+                    $analysis->refresh();
+                }
+
+                $analysesById[$commentId] = $analysis;
+            }
+
+            /*
+             * Preserve the caller's result order.
+             */
+            $ordered = [];
+
+            foreach ($prepared as $commentId => $_item) {
+                $ordered[] = $analysesById[$commentId];
+            }
+
+            return $ordered;
+        }, 3);
     }
 
     /**
-     * Check whether a comment already has an AI analysis.
-     *
-     * Model-version management is intentionally not handled here.
+     * Check whether an analysis exists.
      */
-    public function exists(
-        FacebookComment $comment,
-    ): bool {
+    public function exists(FacebookComment $comment): bool
+    {
         $this->validateComment($comment);
 
         return SentimentAnalysis::query()
-            ->where(
-                'facebook_comment_id',
-                $comment->id,
-            )
+            ->where('facebook_comment_id', $comment->id)
             ->exists();
     }
 
     /**
-     * Retrieve the current AI analysis for a comment.
-     *
-     * @return SentimentAnalysis|null
+     * Retrieve the current analysis.
      */
-    public function get(
-        FacebookComment $comment,
-    ): ?SentimentAnalysis {
+    public function get(FacebookComment $comment): ?SentimentAnalysis
+    {
         $this->validateComment($comment);
 
         return SentimentAnalysis::query()
-            ->where(
-                'facebook_comment_id',
-                $comment->id,
-            )
+            ->where('facebook_comment_id', $comment->id)
             ->first();
     }
 
     /**
-     * Retrieve the latest analysis for a comment.
-     *
-     * This remains useful if historical analysis records are introduced
-     * later.
+     * Retrieve the latest analysis.
      */
-    public function getLatest(
-        FacebookComment $comment,
-    ): ?SentimentAnalysis {
+    public function getLatest(FacebookComment $comment): ?SentimentAnalysis
+    {
         $this->validateComment($comment);
 
         return SentimentAnalysis::query()
-            ->where(
-                'facebook_comment_id',
-                $comment->id,
-            )
+            ->where('facebook_comment_id', $comment->id)
             ->latest('analyzed_at')
             ->first();
     }
 
     /**
-     * Delete the current AI analysis for a comment.
-     *
-     * Model-version management is intentionally not handled here.
+     * Delete the current analysis.
      */
-    public function delete(
-        FacebookComment $comment,
-    ): bool {
+    public function delete(FacebookComment $comment): bool
+    {
         $this->validateComment($comment);
 
         return SentimentAnalysis::query()
-            ->where(
-                'facebook_comment_id',
-                $comment->id,
-            )
+            ->where('facebook_comment_id', $comment->id)
             ->delete() > 0;
     }
 
     /**
-     * Build the database payload for SentimentAnalysis.
+     * Build the database payload.
+     *
+     * Mapper keys are intentionally mapped to database column names here:
+     * topic_label -> topic
+     * priority_label -> priority
      *
      * @param array<string, mixed> $result
-     *
      * @return array<string, mixed>
      */
     private function buildAnalysisData(
@@ -345,15 +296,12 @@ class AIAnalysis
         return [
             'facebook_comment_id' => $comment->id,
 
-            'language' => $result['language_code'],
+            'language' => strtolower(trim($result['language_code'])),
 
-            'sentiment' => $result['sentiment_label'],
+            'sentiment' => strtolower(trim($result['sentiment_label'])),
 
             'confidence' => (float) $result['sentiment_confidence'],
 
-            /*
-             * Optional sentiment probability distribution.
-             */
             'positive_score' => $this->optionalScore(
                 $result,
                 'positive_score',
@@ -369,62 +317,60 @@ class AIAnalysis
                 'negative_score',
             ),
 
-            /*
-             * Optional Python processing time.
-             */
+            'topic' => $this->optionalLabel(
+                $result,
+                'topic_label',
+            ),
+
+            'topic_confidence' => $this->optionalScore(
+                $result,
+                'topic_confidence',
+            ),
+
+            'priority' => $this->optionalLabel(
+                $result,
+                'priority_label',
+            ),
+
+            'priority_confidence' => $this->optionalScore(
+                $result,
+                'priority_confidence',
+            ),
+
             'processing_time_ms' => $this->optionalInteger(
                 $result,
                 'processing_time_ms',
             ),
 
-            /*
-             * Python can provide analyzed_at later.
-             * Laravel uses now() when it is not provided.
-             */
-            'analyzed_at' => $this->analyzedAt(
-                $result,
-            ),
+            'analyzed_at' => $this->analyzedAt($result),
 
-            /*
-             * Store the normalized AI prediction for auditing/debugging.
-             */
             'raw_prediction' => $result,
         ];
     }
 
     /**
-     * Validate the Facebook comment.
+     * Validate the comment before analysis.
      */
-    private function validateComment(
-        FacebookComment $comment,
-    ): void {
-        if (!$comment->exists) {
+    private function validateComment(FacebookComment $comment): void
+    {
+        if (!$comment->exists || $comment->id === null) {
             throw new InvalidArgumentException(
-                'Facebook comment must exist before AI analysis.'
+                'Facebook comment must exist and have an ID.'
             );
         }
 
-        if ($comment->id === null) {
+        if (
+            $comment->message === null
+            || trim($comment->message) === ''
+        ) {
             throw new InvalidArgumentException(
-                'Facebook comment must have an ID.'
-            );
-        }
-
-        if ($comment->message === null) {
-            throw new InvalidArgumentException(
-                'Facebook comment has no message to analyze.'
-            );
-        }
-
-        if (trim($comment->message) === '') {
-            throw new InvalidArgumentException(
-                'Facebook comment message cannot be empty.'
+                "Facebook comment '{$comment->id}' has no message to analyze."
             );
         }
     }
 
     /**
-     * Validate a mapped AI result before persistence.
+     * Validate a mapped AI result.
      *
      * @param array<string, mixed> $result
      */
@@ -441,97 +387,51 @@ class AIAnalysis
         ];
 
         foreach ($requiredFields as $field) {
-            if (!array_key_exists($field, $result)) {
+            if (
+                !array_key_exists($field, $result)
+                || $result[$field] === null
+            ) {
                 throw new InvalidArgumentException(
-                    "AI result for comment '{$comment->id}' "
-                    . "is missing required field '{$field}'."
+                    "AI result for '{$comment->id}' is missing '{$field}'."
                 );
             }
         }
 
-        /*
-         * Correlation ID.
-         */
         if (
             !is_string($result['external_id'])
-            || trim($result['external_id']) === ''
+            || trim($result['external_id']) !== (string) $comment->id
         ) {
             throw new InvalidArgumentException(
-                "Invalid external_id for comment '{$comment->id}'."
+                "AI result does not match comment '{$comment->id}'."
             );
         }
 
-        if (
-            (string) $result['external_id']
-            !== (string) $comment->id
-        ) {
-            throw new InvalidArgumentException(
-                "AI result does not belong to Facebook comment "
-                . "'{$comment->id}'."
-            );
-        }
-
-        /*
-         * Language.
-         */
         if (
             !is_string($result['language_code'])
-            || trim($result['language_code']) === ''
+            || !in_array(
+                strtolower(trim($result['language_code'])),
+                self::ALLOWED_LANGUAGES,
+                true,
+            )
         ) {
             throw new InvalidArgumentException(
-                "Invalid language_code for comment '{$comment->id}'."
+                "Unsupported language for comment '{$comment->id}'."
             );
         }
 
-        $language = strtolower(
-            trim($result['language_code'])
-        );
-
-        $allowedLanguages = [
-            'am',
-            'om',
-            'en',
-        ];
-
-        if (!in_array($language, $allowedLanguages, true)) {
-            throw new InvalidArgumentException(
-                "Unsupported language '{$language}' "
-                . "for comment '{$comment->id}'."
-            );
-        }
-
-        /*
-         * Sentiment.
-         */
         if (
             !is_string($result['sentiment_label'])
-            || trim($result['sentiment_label']) === ''
+            || !in_array(
+                strtolower(trim($result['sentiment_label'])),
+                self::ALLOWED_SENTIMENTS,
+                true,
+            )
         ) {
             throw new InvalidArgumentException(
-                "Invalid sentiment_label for comment '{$comment->id}'."
+                "Unsupported sentiment for comment '{$comment->id}'."
             );
         }
 
-        $sentiment = strtolower(
-            trim($result['sentiment_label'])
-        );
-
-        $allowedSentiments = [
-            'negative',
-            'neutral',
-            'positive',
-        ];
-
-        if (!in_array($sentiment, $allowedSentiments, true)) {
-            throw new InvalidArgumentException(
-                "Unsupported sentiment '{$sentiment}' "
-                . "for comment '{$comment->id}'."
-            );
-        }
-
-        /*
-         * Confidence values must be between 0 and 1.
-         */
         $this->validateConfidence(
             $result['language_confidence'],
             'language_confidence',
@@ -544,16 +444,13 @@ class AIAnalysis
             $comment,
         );
 
-        /*
-         * Optional probability scores.
-         */
-        $optionalScores = [
+        foreach ([
             'positive_score',
             'neutral_score',
             'negative_score',
-        ];
-
-        foreach ($optionalScores as $field) {
+            'topic_confidence',
+            'priority_confidence',
+        ] as $field) {
             if (
                 array_key_exists($field, $result)
                 && $result[$field] !== null
@@ -566,9 +463,22 @@ class AIAnalysis
             }
         }
 
-        /*
-         * Optional processing time.
-         */
+        foreach (['topic_label', 'priority_label'] as $field) {
+            if (
+                array_key_exists($field, $result)
+                && $result[$field] !== null
+                && (
+                    !is_string($result[$field])
+                    || trim($result[$field]) === ''
+                )
+            ) {
+                throw new InvalidArgumentException(
+                    "AI {$field} must be a non-empty string or null "
+                    . "for comment '{$comment->id}'."
+                );
+            }
+        }
+
         if (
             array_key_exists('processing_time_ms', $result)
             && $result['processing_time_ms'] !== null
@@ -578,19 +488,24 @@ class AIAnalysis
                 $comment,
             );
         }
+
+        /*
+         * Validate timestamps before any database writes.
+         */
+        $this->analyzedAt($result);
     }
 
     /**
-     * Validate an AI confidence/probability score.
+     * Validate a confidence or probability value.
      */
     private function validateConfidence(
         mixed $value,
         string $field,
         FacebookComment $comment,
     ): void {
-        if (!is_numeric($value)) {
+        if (!is_numeric($value) || !is_finite((float) $value)) {
             throw new InvalidArgumentException(
-                "AI {$field} must be numeric "
+                "AI {$field} must be a finite numeric value "
                 . "for comment '{$comment->id}'."
             );
         }
@@ -606,54 +521,68 @@ class AIAnalysis
     }
 
     /**
-     * Validate processing time.
+     * Validate a non-negative integer processing time.
      */
     private function validateProcessingTime(
         mixed $value,
         FacebookComment $comment,
     ): void {
         if (
-            is_int($value)
-            || (
+            !is_int($value)
+            && !(
                 is_string($value)
-                && filter_var(
-                    $value,
-                    FILTER_VALIDATE_INT,
-                ) !== false
+                && filter_var($value, FILTER_VALIDATE_INT) !== false
+            )
+            && !(
+                is_float($value)
+                && is_finite($value)
+                && floor($value) === $value
             )
         ) {
-            if ((int) $value < 0) {
-                throw new InvalidArgumentException(
-                    "AI processing_time_ms cannot be negative "
-                    . "for comment '{$comment->id}'."
-                );
-            }
-
-            return;
+            throw new InvalidArgumentException(
+                "AI processing_time_ms must be an integer "
+                . "for comment '{$comment->id}'."
+            );
         }
 
-        if (
-            is_float($value)
-            && floor($value) === $value
-        ) {
-            if ($value < 0) {
-                throw new InvalidArgumentException(
-                    "AI processing_time_ms cannot be negative "
-                    . "for comment '{$comment->id}'."
-                );
-            }
-
-            return;
+        if ((float) $value < 0) {
+            throw new InvalidArgumentException(
+                "AI processing_time_ms cannot be negative "
+                . "for comment '{$comment->id}'."
+            );
         }
-
-        throw new InvalidArgumentException(
-            "AI processing_time_ms must be an integer "
-            . "for comment '{$comment->id}'."
-        );
     }
 
     /**
-     * Read an optional probability score.
+     * Read and validate an optional label.
+     *
+     * @param array<string, mixed> $result
+     */
+    private function optionalLabel(
+        array $result,
+        string $field,
+    ): ?string {
+        if (
+            !array_key_exists($field, $result)
+            || $result[$field] === null
+        ) {
+            return null;
+        }
+
+        if (
+            !is_string($result[$field])
+            || trim($result[$field]) === ''
+        ) {
+            throw new InvalidArgumentException(
+                "AI field '{$field}' must be a non-empty string or null."
+            );
+        }
+
+        return trim($result[$field]);
+    }
+
+    /**
+     * Read an optional probability/confidence value.
      *
      * @param array<string, mixed> $result
      */
@@ -668,7 +597,24 @@ class AIAnalysis
             return null;
         }
 
-        return (float) $result[$field];
+        if (
+            !is_numeric($result[$field])
+            || !is_finite((float) $result[$field])
+        ) {
+            throw new InvalidArgumentException(
+                "AI field '{$field}' must be numeric or null."
+            );
+        }
+
+        $score = (float) $result[$field];
+
+        if ($score < 0.0 || $score > 1.0) {
+            throw new InvalidArgumentException(
+                "AI field '{$field}' must be between 0 and 1."
+            );
+        }
+
+        return $score;
     }
 
     /**
@@ -695,37 +641,33 @@ class AIAnalysis
 
         if (
             is_string($value)
-            && filter_var(
-                $value,
-                FILTER_VALIDATE_INT,
-            ) !== false
+            && filter_var($value, FILTER_VALIDATE_INT) !== false
         ) {
             return (int) $value;
         }
 
         if (
             is_float($value)
+            && is_finite($value)
             && floor($value) === $value
+            && $value <= PHP_INT_MAX
+            && $value >= PHP_INT_MIN
         ) {
             return (int) $value;
         }
 
         throw new InvalidArgumentException(
-            "AI field '{$field}' must be an integer."
+            "AI field '{$field}' must be an integer or null."
         );
     }
 
     /**
-     * Resolve analyzed_at from the AI result.
-     *
-     * If Python does not provide analyzed_at yet,
-     * Laravel uses the current application time.
+     * Resolve and validate the analysis timestamp.
      *
      * @param array<string, mixed> $result
      */
-    private function analyzedAt(
-        array $result,
-    ): mixed {
+    private function analyzedAt(array $result): Carbon
+    {
         if (
             !array_key_exists('analyzed_at', $result)
             || $result['analyzed_at'] === null
@@ -733,20 +675,21 @@ class AIAnalysis
             return now();
         }
 
-        if (!is_string($result['analyzed_at'])) {
+        $value = $result['analyzed_at'];
+
+        if (!is_string($value) || trim($value) === '') {
             throw new InvalidArgumentException(
-                'AI analyzed_at must be a valid date string.'
+                'AI analyzed_at must be a non-empty date string or null.'
             );
         }
 
-        $value = trim($result['analyzed_at']);
-
-        if ($value === '') {
+        try {
+            return Carbon::parse(trim($value));
+        } catch (Throwable $exception) {
             throw new InvalidArgumentException(
-                'AI analyzed_at cannot be empty.'
+                'AI analyzed_at contains an invalid date.',
+                previous: $exception,
             );
         }
-
-        return $value;
     }
 }
