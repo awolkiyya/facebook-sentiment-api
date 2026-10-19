@@ -16,27 +16,64 @@ class SentimentAnalysis extends Model
 
     protected $table = 'sentiment_analyses';
 
+    /**
+     * Attributes that can be mass assigned.
+     */
     protected $fillable = [
         'facebook_comment_id',
         'sentiment_model_version_id',
+
+        /*
+         * Language
+         */
         'language',
+
+        /*
+         * Sentiment
+         */
         'sentiment',
         'confidence',
         'positive_score',
         'neutral_score',
         'negative_score',
+
+        /*
+         * Topic classification
+         */
+        'topic',
+        'topic_confidence',
+
+        /*
+         * Priority classification
+         */
+        'priority',
+        'priority_confidence',
+
+        /*
+         * Processing metadata
+         */
         'processing_time_ms',
         'analyzed_at',
         'raw_prediction',
     ];
 
+    /**
+     * Attribute casting.
+     */
     protected $casts = [
         'confidence' => 'float',
+
         'positive_score' => 'float',
         'neutral_score' => 'float',
         'negative_score' => 'float',
+
+        'topic_confidence' => 'float',
+        'priority_confidence' => 'float',
+
         'processing_time_ms' => 'integer',
+
         'analyzed_at' => 'datetime',
+
         'raw_prediction' => 'array',
     ];
 

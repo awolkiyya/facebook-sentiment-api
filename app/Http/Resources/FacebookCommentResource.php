@@ -18,10 +18,10 @@ class FacebookCommentResource extends JsonResource
 
         return [
             /*
-             * -----------------------------------------------------
-             * IDENTITY
-             * -----------------------------------------------------
-             */
+            |--------------------------------------------------------------------------
+            | Identity
+            |--------------------------------------------------------------------------
+            */
 
             'id' => $this->id,
 
@@ -30,10 +30,10 @@ class FacebookCommentResource extends JsonResource
             'parent_comment_id' => $this->parent_comment_id,
 
             /*
-             * -----------------------------------------------------
-             * AUTHOR
-             * -----------------------------------------------------
-             */
+            |--------------------------------------------------------------------------
+            | Author
+            |--------------------------------------------------------------------------
+            */
 
             'author' => [
                 'name' => $this->author_name,
@@ -41,10 +41,10 @@ class FacebookCommentResource extends JsonResource
             ],
 
             /*
-             * -----------------------------------------------------
-             * CONTENT
-             * -----------------------------------------------------
-             */
+            |--------------------------------------------------------------------------
+            | Content
+            |--------------------------------------------------------------------------
+            */
 
             'message' => $this->message,
 
@@ -53,69 +53,90 @@ class FacebookCommentResource extends JsonResource
             'commented_at' => $this->commented_at?->toISOString(),
 
             /*
-             * -----------------------------------------------------
-             * ENGAGEMENT
-             * -----------------------------------------------------
-             */
+            |--------------------------------------------------------------------------
+            | Comment Engagement
+            |--------------------------------------------------------------------------
+            |
+            | Return only metrics actually collected and persisted.
+            |
+            */
 
             'engagement' => [
-                'likes' => $this->like_count,
+                'like_count' => $this->like_count,
             ],
 
             /*
-             * -----------------------------------------------------
-             * AI ANALYSIS
-             * -----------------------------------------------------
-             */
+            |--------------------------------------------------------------------------
+            | AI Analysis
+            |--------------------------------------------------------------------------
+            */
 
             'ai_analysis' => $sentimentAnalysis
                 ? [
+                    /*
+                     * Sentiment classification
+                     */
                     'sentiment' => [
-                        'label' =>
-                            $sentimentAnalysis->sentiment,
+                        'label' => $sentimentAnalysis->sentiment,
 
-                        'confidence' =>
-                            $sentimentAnalysis->confidence,
+                        'confidence' => $sentimentAnalysis->confidence,
 
                         'scores' => [
-                            'positive' =>
-                                $sentimentAnalysis->positive_score,
+                            'positive' => $sentimentAnalysis->positive_score,
 
-                            'neutral' =>
-                                $sentimentAnalysis->neutral_score,
+                            'neutral' => $sentimentAnalysis->neutral_score,
 
-                            'negative' =>
-                                $sentimentAnalysis->negative_score,
+                            'negative' => $sentimentAnalysis->negative_score,
                         ],
                     ],
 
-                    'language' =>
-                        $sentimentAnalysis->language,
+                    /*
+                     * Language detection
+                     */
+                    'language' => $sentimentAnalysis->language,
 
+                    /*
+                     * Civic topic classification
+                     *
+                     * Topic values are supplied by the AI service.
+                     * Laravel does not enforce a fixed topic vocabulary.
+                     */
+                    'topic' => $sentimentAnalysis->topic,
+
+                    'topic_confidence' =>
+                        $sentimentAnalysis->topic_confidence,
+
+                    /*
+                     * Priority classification
+                     */
+                    'priority' => $sentimentAnalysis->priority,
+
+                    'priority_confidence' =>
+                        $sentimentAnalysis->priority_confidence,
+
+                    /*
+                     * Processing metadata
+                     */
                     'processing_time_ms' =>
                         $sentimentAnalysis->processing_time_ms,
 
                     'analyzed_at' =>
-                        $sentimentAnalysis->analyzed_at
-                            ?->toISOString(),
+                        $sentimentAnalysis->analyzed_at?->toISOString(),
 
                     'sentiment_model_version_id' =>
-                        $sentimentAnalysis
-                            ->sentiment_model_version_id,
+                        $sentimentAnalysis->sentiment_model_version_id,
                 ]
                 : null,
 
             /*
-             * -----------------------------------------------------
-             * TIMESTAMPS
-             * -----------------------------------------------------
-             */
+            |--------------------------------------------------------------------------
+            | Timestamps
+            |--------------------------------------------------------------------------
+            */
 
-            'created_at' =>
-                $this->created_at?->toISOString(),
+            'created_at' => $this->created_at?->toISOString(),
 
-            'updated_at' =>
-                $this->updated_at?->toISOString(),
+            'updated_at' => $this->updated_at?->toISOString(),
         ];
     }
 }

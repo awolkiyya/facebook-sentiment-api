@@ -13,8 +13,8 @@ class AIResultMapper
     /**
      * Map the complete AI batch response into a Laravel-friendly structure.
      *
-     * Topic and priority are optional AI-generated classifications.
-     * Their labels are not restricted to a predefined vocabulary.
+     * Topic and priority labels are optional and are not restricted to
+     * a predefined vocabulary.
      *
      * @param array<string, mixed> $response
      * @return array<int, array<string, mixed>>
@@ -25,6 +25,8 @@ class AIResultMapper
     {
         $results = $response['results'] ?? null;
 
+        $logPayload = $this->shouldLogPayload();
+
         Log::debug('AIResultMapper | Incoming batch response.', [
             'has_results' => array_key_exists('results', $response),
             'response_keys' => array_keys($response),
@@ -32,9 +34,7 @@ class AIResultMapper
             'result_count' => is_array($results)
                 ? count($results)
                 : null,
-            'response' => $this->shouldLogPayload()
-                ? $response
-                : null,
+            'response' => $logPayload ? $response : null,
         ]);
 
         if (!is_array($results)) {
@@ -57,9 +57,7 @@ class AIResultMapper
                     [
                         'index' => $index,
                         'result_type' => get_debug_type($result),
-                        'result' => $this->shouldLogPayload()
-                            ? $result
-                            : null,
+                        'result' => $logPayload ? $result : null,
                     ]
                 );
 
@@ -77,31 +75,81 @@ class AIResultMapper
                     'index' => $index,
                     'external_id' => $result['id'] ?? null,
                     'available_fields' => array_keys($result),
+
                     'language_type' => get_debug_type(
                         $result['language'] ?? null
                     ),
+
                     'sentiment_type' => get_debug_type(
                         $result['sentiment'] ?? null
                     ),
+
                     'topic_type' => get_debug_type(
                         $result['topic'] ?? null
                     ),
-                    'topic' => $this->shouldLogPayload()
-                        ? ($result['topic'] ?? null)
-                        : null,
+
                     'priority_type' => get_debug_type(
                         $result['priority'] ?? null
                     ),
-                    'priority' => $this->shouldLogPayload()
+
+                    'sentiment_scores_type' => get_debug_type(
+                        is_array($result['sentiment'] ?? null)
+                            ? ($result['sentiment']['scores'] ?? null)
+                            : null
+                    ),
+
+                    'processing_time_ms' =>
+                        $result['processing_time_ms'] ?? null,
+
+                    'topic' => $logPayload
+                        ? ($result['topic'] ?? null)
+                        : null,
+
+                    'priority' => $logPayload
                         ? ($result['priority'] ?? null)
                         : null,
                 ]
             );
 
             try {
-                $mapped[] = $this->mapResult(
+                $mappedResult = $this->mapResult(
                     $result,
                     (int) $index,
+                );
+
+                $mapped[] = $mappedResult;
+
+                Log::debug(
+                    'AIResultMapper | Result mapped successfully.',
+                    [
+                        'index' => $index,
+                        'external_id' => $mappedResult['external_id'],
+
+                        'language_code' =>
+                            $mappedResult['language_code'],
+
+                        'sentiment_label' =>
+                            $mappedResult['sentiment_label'],
+
+                        'has_sentiment_scores' =>
+                            $mappedResult['positive_score'] !== null
+                            && $mappedResult['neutral_score'] !== null
+                            && $mappedResult['negative_score'] !== null,
+
+                        'topic_label' => $mappedResult['topic_label'],
+
+                        'topic_confidence' =>
+                            $mappedResult['topic_confidence'],
+
+                        'priority_label' =>
+                            $mappedResult['priority_label'],
+
+                        'priority_confidence' =>
+                            $mappedResult['priority_confidence'],
+
+                        'processing_time_ms' =>
+                            $mappedResult['processing_time_ms'],
+                    ]
                 );
             } catch (InvalidArgumentException $exception) {
                 Log::error(
@@ -110,15 +158,17 @@ class AIResultMapper
                         'index' => $index,
                         'external_id' => $result['id'] ?? null,
                         'available_fields' => array_keys($result),
+
                         'topic_type' => get_debug_type(
                             $result['topic'] ?? null
                         ),
+
                         'priority_type' => get_debug_type(
                             $result['priority'] ?? null
                         ),
-                        'result' => $this->shouldLogPayload()
-                            ? $result
-                            : null,
+
+                        'result' => $logPayload ? $result : null,
+
                         'exception_message' => $exception->getMessage(),
                     ]
                 );
@@ -150,6 +200,21 @@ class AIResultMapper
     /**
      * Map a single AI result.
      *
+     * Expected classification structure:
+     *
+     * [
+     *     'topic' => [
+     *         'label' => 'roads_infrastructure',
+     *         'confidence' => 0.95,
+     *     ],
+     *     'priority' => [
+     *         'label' => 'high',
+     *         'confidence' => 0.88,
+     *     ],
+     * ]
+     *
+     * Topic and priority can also be plain strings.
+     *
      * @param array<string, mixed> $result
      * @return array<string, mixed>
      *
@@ -177,7 +242,14 @@ class AIResultMapper
             "AI result '{$id}'",
         );
 
+        $scores = is_array($sentiment['scores'] ?? null)
+            ? $sentiment['scores']
+            : [];
+
         return [
+            /*
+             * External identity
+             */
             'external_id' => $id,
 
             /*
@@ -196,7 +268,7 @@ class AIResultMapper
             ),
 
             /*
-             * Sentiment
+             * Sentiment classification
              */
             'sentiment_label' => $this->requiredString(
                 $sentiment,
@@ -216,11 +288,30 @@ class AIResultMapper
             ),
 
             /*
-             * Topic
+             * Sentiment probability scores
              *
-             * Accepts a string or an object containing "label".
-             * The topic vocabulary is not restricted.
-             * Missing or malformed optional confidence becomes null.
+             * Missing or invalid optional scores become null.
+             */
+            'positive_score' => $this->optionalScore(
+                $scores,
+                'positive',
+            ),
+
+            'neutral_score' => $this->optionalScore(
+                $scores,
+                'neutral',
+            ),
+
+            'negative_score' => $this->optionalScore(
+                $scores,
+                'negative',
+            ),
+
+            /*
+             * Topic classification
+             *
+             * Supports a string or an object containing label and
+             * confidence. Labels are not restricted to fixed values.
              */
             'topic_label' => $this->optionalLabel(
                 $result['topic'] ?? null,
@@ -231,10 +322,7 @@ class AIResultMapper
             ),
 
             /*
-             * Priority
-             *
-             * Accepts a string or an object containing "label".
-             * The priority vocabulary is not restricted.
+             * Priority classification
              */
             'priority_label' => $this->optionalLabel(
                 $result['priority'] ?? null,
@@ -242,6 +330,16 @@ class AIResultMapper
 
             'priority_confidence' => $this->optionalConfidence(
                 $result['priority'] ?? null,
+            ),
+
+            /*
+             * Processing metadata
+             *
+             * The AI service must return this field for it to be mapped.
+             */
+            'processing_time_ms' => $this->optionalInteger(
+                $result,
+                'processing_time_ms',
             ),
         ];
     }
@@ -308,12 +406,10 @@ class AIResultMapper
     /**
      * Extract an optional classification label.
      *
-     * Supported examples:
+     * Supported values:
      * - "roads_infrastructure"
      * - ["label" => "roads_infrastructure", "confidence" => 0.95]
      * - null
-     *
-     * @return string|null
      */
     private function optionalLabel(mixed $value): ?string
     {
@@ -372,6 +468,39 @@ class AIResultMapper
     }
 
     /**
+     * Extract an optional probability score.
+     *
+     * Valid values must be numeric and between 0 and 1.
+     *
+     * @param array<string, mixed> $scores
+     */
+    private function optionalScore(
+        array $scores,
+        string $key,
+    ): ?float {
+        if (!array_key_exists($key, $scores)) {
+            return null;
+        }
+
+        $value = $scores[$key];
+
+        if (
+            !is_numeric($value)
+            || !is_finite((float) $value)
+        ) {
+            return null;
+        }
+
+        $score = (float) $value;
+
+        if ($score < 0.0 || $score > 1.0) {
+            return null;
+        }
+
+        return $score;
+    }
+
+    /**
      * Extract and validate required confidence.
      *
      * Confidence must be numeric and between 0 and 1.
@@ -417,13 +546,18 @@ class AIResultMapper
     /**
      * Extract an optional integer.
      *
+     * Missing values become null. Present but invalid values throw an
+     * exception so malformed processing metadata is not silently accepted.
+     *
      * @param array<string, mixed> $data
+     *
+     * @throws InvalidArgumentException
      */
     private function optionalInteger(
         array $data,
         string $key,
     ): ?int {
-        if (!array_key_exists($key, $data)) {
+        if (!array_key_exists($key, $data) || $data[$key] === null) {
             return null;
         }
 
@@ -457,7 +591,7 @@ class AIResultMapper
      * Determine whether full incoming payloads should be logged.
      *
      * Keep AI_LOG_PAYLOADS disabled in production unless temporarily
-     * needed for debugging.
+     * needed for debugging. AI payloads may contain user-generated content.
      */
     private function shouldLogPayload(): bool
     {
