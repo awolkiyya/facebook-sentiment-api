@@ -197,6 +197,22 @@ Route::prefix('facebook')->group(function (): void {
             )->name('facebook.pages.posts.sync');
 
 
+
+            /*
+            * Get a single saved Facebook Post.
+            *
+            * {facebookPageId} = External Meta/Facebook Page ID
+            * {facebookPostId} = Internal Laravel FacebookPost UUID
+            *
+            * GET /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}
+            */
+            Route::get(
+                '/{facebookPageId}/posts/{facebookPostId}',
+                [FacebookPostController::class, 'show']
+            )->whereUuid('facebookPostId')
+                ->name('facebook.pages.posts.show');
+
+
             /*
             |--------------------------------------------------------------------------
             | Facebook Comments

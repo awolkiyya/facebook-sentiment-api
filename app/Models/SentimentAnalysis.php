@@ -14,66 +14,34 @@ class SentimentAnalysis extends Model
     use HasFactory;
     use HasUuids;
 
-    /**
-     * The table associated with the model.
-     */
     protected $table = 'sentiment_analyses';
 
-    /**
-     * The attributes that are mass assignable.
-     *
-     * @var array<int, string>
-     */
     protected $fillable = [
         'facebook_comment_id',
         'sentiment_model_version_id',
-
         'language',
-
         'sentiment',
         'confidence',
-
         'positive_score',
         'neutral_score',
         'negative_score',
-
         'processing_time_ms',
-
         'analyzed_at',
-
         'raw_prediction',
     ];
 
-    /**
-     * The attributes that should be cast.
-     *
-     * @var array<string, string>
-     */
     protected $casts = [
         'confidence' => 'float',
-
         'positive_score' => 'float',
         'neutral_score' => 'float',
         'negative_score' => 'float',
-
         'processing_time_ms' => 'integer',
-
         'analyzed_at' => 'datetime',
-
         'raw_prediction' => 'array',
     ];
 
-    /*
-    |--------------------------------------------------------------------------
-    | Relationships
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Get the Facebook comment associated with this analysis.
-     *
-     * sentiment_analyses.facebook_comment_id references
-     * facebook_comments.id.
+     * Facebook comment associated with this analysis.
      */
     public function facebookComment(): BelongsTo
     {
@@ -85,7 +53,7 @@ class SentimentAnalysis extends Model
     }
 
     /**
-     * Get the sentiment model version used for this analysis.
+     * Model version used to generate this prediction.
      */
     public function sentimentModelVersion(): BelongsTo
     {

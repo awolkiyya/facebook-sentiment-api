@@ -50,10 +50,7 @@ class FacebookComment extends Model
     }
 
     /**
-     * Parent comment.
-     *
-     * parent_comment_id stores the external
-     * Meta/Facebook comment ID.
+     * Parent comment, identified by the external Meta comment ID.
      */
     public function parentComment(): BelongsTo
     {
@@ -77,7 +74,7 @@ class FacebookComment extends Model
     }
 
     /**
-     * All sentiment analyses for this comment.
+     * All persisted sentiment analyses for this comment.
      */
     public function sentimentAnalyses(): HasMany
     {
@@ -89,16 +86,9 @@ class FacebookComment extends Model
     }
 
     /**
-     * Latest sentiment analysis for this comment.
+     * Latest persisted sentiment analysis.
      *
-     * IMPORTANT:
-     *
-     * Do not use latestOfMany() here because the
-     * sentiment_analyses primary key is UUID and PostgreSQL
-     * cannot execute MAX(uuid).
-     *
-     * Ordering is therefore performed directly on the
-     * relationship.
+     * The UUID primary key is not used as an aggregate.
      */
     public function latestSentimentAnalysis(): HasOne
     {
@@ -106,8 +96,9 @@ class FacebookComment extends Model
             SentimentAnalysis::class,
             'facebook_comment_id',
             'id',
-        )
-            ->orderByDesc('analyzed_at')
-            ->orderByDesc('created_at');
+        )->ofMany([
+            'analyzed_at' => 'max',
+            'created_at' => 'max',
+        ]);
     }
 }

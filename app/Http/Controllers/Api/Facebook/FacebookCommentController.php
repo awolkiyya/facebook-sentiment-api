@@ -20,6 +20,8 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use RuntimeException;
 use Throwable;
+use App\Services\ApiResponse;
+
 
 final class FacebookCommentController extends Controller
 {
@@ -49,218 +51,298 @@ final class FacebookCommentController extends Controller
      */
     private const SYNC_RUN_TYPE = 'comments';
 
+   
+
+/*
+|--------------------------------------------------------------------------
+| List Comments With AI Analysis
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * List locally synchronized Facebook comments with their latest
+ * persisted AI sentiment analysis.
+ *
+ * GET:
+ * /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments
+ *
+ * Route contracts:
+ * - facebookPageId: external Meta/Facebook Page ID
+ * - facebookPostId: internal Laravel FacebookPost UUID
+ *
+ * This endpoint never calls Meta and never performs AI inference.
+ *
+ * @throws \Throwable
+ */
+public function index(Request $request): JsonResponse
+{
+    $requestId = $this->requestId($request);
+
+    $user = $request->user();
+
+    $facebookPageId = trim(
+        (string) $request->route('facebookPageId'),
+    );
+
+    $facebookPostId = trim(
+        (string) $request->route('facebookPostId'),
+    );
+
     /*
     |--------------------------------------------------------------------------
-    | List Comments
+    | Request Logging
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * List locally synchronized Facebook comments.
-     *
-     * GET:
-     *
-     * /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments
-     *
-     * Route contracts:
-     *
-     * facebookPageId
-     *     = external Meta/Facebook Page ID
-     *
-     * facebookPostId
-     *     = internal Laravel FacebookPost UUID
-     *
-     * This endpoint NEVER calls Meta.
-     */
-    public function index(Request $request): JsonResponse
-    {
-        $requestId = $this->requestId($request);
+    Log::info('Facebook comments index request started.', [
+        'request_id' => $requestId,
+        'method' => $request->method(),
+        'path' => $request->path(),
+        'user_id' => $user?->id,
+        'facebook_page_id' => $facebookPageId,
+        'facebook_post_id' => $facebookPostId,
+        'ip' => $request->ip(),
+    ]);
 
-        $user = $request->user();
+    /*
+    |--------------------------------------------------------------------------
+    | Authentication
+    |--------------------------------------------------------------------------
+    */
 
-        $facebookPageId = trim(
-            (string) $request->route('facebookPageId'),
+    if ($user === null) {
+        Log::warning(
+            'Facebook comments index rejected: unauthenticated.',
+            [
+                'request_id' => $requestId,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'ip' => $request->ip(),
+            ],
         );
 
-        $facebookPostId = trim(
-            (string) $request->route('facebookPostId'),
+        return ApiResponse::unauthorized(
+            'Authentication is required.',
         );
+    }
 
-        Log::info('Facebook comments index request started.', [
-            'request_id' => $requestId,
-            'method' => $request->method(),
-            'path' => $request->path(),
-            'user_id' => $user?->id,
-            'facebook_page_id' => $facebookPageId,
-            'facebook_post_id' => $facebookPostId,
-            'ip' => $request->ip(),
-        ]);
-
+    try {
         /*
         |--------------------------------------------------------------------------
-        | Authentication
+        | Resolve Authorized Facebook Page
         |--------------------------------------------------------------------------
         */
 
-        if ($user === null) {
-            Log::warning(
-                'Facebook comments index rejected: unauthenticated.',
-                [
-                    'request_id' => $requestId,
-                    'facebook_page_id' => $facebookPageId,
-                    'facebook_post_id' => $facebookPostId,
-                    'ip' => $request->ip(),
-                ],
-            );
+        $facebookPage = $this->resolveUserPage(
+            userId: (string) $user->id,
+            facebookPageId: $facebookPageId,
+            requestId: $requestId,
+        );
 
-            return response()->json([
-                'success' => false,
-                'message' => 'Unauthenticated.',
-            ], Response::HTTP_UNAUTHORIZED);
-        }
+        /*
+        |--------------------------------------------------------------------------
+        | Resolve Facebook Post
+        |--------------------------------------------------------------------------
+        |
+        | The post must belong to the resolved page.
+        | facebookPostId is the internal FacebookPost UUID.
+        |
+        */
 
-        try {
-            /*
-            |--------------------------------------------------------------------------
-            | Resolve Page
-            |--------------------------------------------------------------------------
-            */
+        $facebookPost = $this->resolvePost(
+            page: $facebookPage,
+            facebookPostId: $facebookPostId,
+            requestId: $requestId,
+        );
 
-            $facebookPage = $this->resolveUserPage(
-                userId: (string) $user->id,
-                facebookPageId: $facebookPageId,
-                requestId: $requestId,
-            );
+        /*
+        |--------------------------------------------------------------------------
+        | Pagination
+        |--------------------------------------------------------------------------
+        */
 
-            /*
-            |--------------------------------------------------------------------------
-            | Resolve Post
-            |--------------------------------------------------------------------------
-            */
-
-            $facebookPost = $this->resolvePost(
-                page: $facebookPage,
-                facebookPostId: $facebookPostId,
-                requestId: $requestId,
-            );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Pagination
-            |--------------------------------------------------------------------------
-            */
-
-            $perPage = min(
-                max(
-                    $request->integer(
-                        'per_page',
-                        self::DEFAULT_PER_PAGE,
-                    ),
-                    1,
+        $perPage = min(
+            max(
+                $request->integer(
+                    'per_page',
+                    self::DEFAULT_PER_PAGE,
                 ),
-                self::MAX_PER_PAGE,
-            );
-
-            $pageNumber = max(
-                $request->integer('page', 1),
                 1,
-            );
+            ),
+            self::MAX_PER_PAGE,
+        );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Fetch Local Comments
-            |--------------------------------------------------------------------------
-            */
+        $pageNumber = max(
+            $request->integer('page', 1),
+            1,
+        );
 
-            $comments = FacebookComment::query()
-                ->where(
-                    'facebook_post_id',
-                    $facebookPost->id,
-                )
-                ->orderByDesc('commented_at')
-                ->orderByDesc('created_at')
-                ->paginate(
-                    perPage: $perPage,
-                    page: $pageNumber,
-                )
-                ->withQueryString();
+        /*
+        |--------------------------------------------------------------------------
+        | Fetch Comments And Latest Sentiment Analysis
+        |--------------------------------------------------------------------------
+        |
+        | facebook_comments.id
+        |     -> sentiment_analyses.facebook_comment_id
+        |
+        | Eager loading prevents N+1 queries.
+        | Comments without an analysis are retained.
+        |
+        */
 
-            Log::info(
-                'Facebook comments loaded successfully.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user->id,
-                    'facebook_page_internal_id' => $facebookPage->id,
-                    'facebook_page_id' => $facebookPage->facebook_page_id,
-                    'facebook_post_internal_id' => $facebookPost->id,
-                    'facebook_post_id' => $facebookPost->facebook_post_id,
-                    'current_page' => $comments->currentPage(),
-                    'per_page' => $comments->perPage(),
-                    'total' => $comments->total(),
-                    'returned_count' => $comments->count(),
-                ],
-            );
+        $comments = FacebookComment::query()
+            ->where(
+                'facebook_post_id',
+                $facebookPost->id,
+            )
+            ->with('latestSentimentAnalysis')
+            ->orderByDesc('commented_at')
+            ->orderByDesc('created_at')
+            ->paginate(
+                perPage: $perPage,
+                page: $pageNumber,
+            )
+            ->withQueryString();
 
-            return response()->json([
-                'success' => true,
+        /*
+        |--------------------------------------------------------------------------
+        | Count Analyzed Comments On This Page
+        |--------------------------------------------------------------------------
+        |
+        | The relationship is already eager-loaded.
+        | No additional query is needed for this count.
+        |
+        */
 
-                'data' => [
-                    'comments' => FacebookCommentResource::collection(
-                        $comments->items(),
-                    ),
+        $analyzedCount = collect($comments->items())
+            ->filter(
+                static fn (FacebookComment $comment): bool =>
+                    $comment->latestSentimentAnalysis !== null,
+            )
+            ->count();
 
-                    'pagination' => [
-                        'current_page' => $comments->currentPage(),
-                        'per_page' => $comments->perPage(),
-                        'total' => $comments->total(),
-                        'last_page' => $comments->lastPage(),
-                        'from' => $comments->firstItem(),
-                        'to' => $comments->lastItem(),
-                    ],
-                ],
-            ]);
-        } catch (RuntimeException $exception) {
-            Log::error(
-                'Facebook comments index request failed with RuntimeException.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user->id,
-                    'facebook_page_id' => $facebookPageId,
-                    'facebook_post_id' => $facebookPostId,
-                    'exception_class' => $exception::class,
-                    'exception_message' =>
-                        $this->safeExceptionMessage($exception),
-                ],
-            );
+        /*
+        |--------------------------------------------------------------------------
+        | Serialize Resources
+        |--------------------------------------------------------------------------
+        |
+        | ApiResponse::success() expects a normal payload here.
+        | Each resource is resolved explicitly into an array.
+        |
+        */
 
-            report($exception);
+        $commentData = collect($comments->items())
+            ->map(
+                fn (FacebookComment $comment): array =>
+                    FacebookCommentResource::make($comment)
+                        ->resolve($request),
+            )
+            ->values()
+            ->all();
 
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to retrieve Facebook comments.',
-            ], Response::HTTP_INTERNAL_SERVER_ERROR);
-        } catch (Throwable $exception) {
-            Log::critical(
-                'Facebook comments index request failed unexpectedly.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user->id,
-                    'facebook_page_id' => $facebookPageId,
-                    'facebook_post_id' => $facebookPostId,
-                    'exception_class' => $exception::class,
-                    'exception_message' =>
-                        $this->safeExceptionMessage($exception),
-                ],
-            );
+        /*
+        |--------------------------------------------------------------------------
+        | Pagination Metadata
+        |--------------------------------------------------------------------------
+        */
 
-            report($exception);
+        $pagination = [
+            'current_page' => $comments->currentPage(),
+            'per_page' => $comments->perPage(),
+            'total' => $comments->total(),
+            'last_page' => $comments->lastPage(),
+            'from' => $comments->firstItem(),
+            'to' => $comments->lastItem(),
+            'has_more' => $comments->hasMorePages(),
+        ];
 
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to retrieve Facebook comments.',
-            ], Response::HTTP_INTERNAL_SERVER_ERROR);
-        }
+        /*
+        |--------------------------------------------------------------------------
+        | Success Logging
+        |--------------------------------------------------------------------------
+        */
+
+        Log::info(
+            'Facebook comments with AI analysis loaded successfully.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+
+                'facebook_page_internal_id' => $facebookPage->id,
+                'facebook_page_id' => $facebookPage->facebook_page_id,
+
+                'facebook_post_internal_id' => $facebookPost->id,
+                'facebook_post_id' => $facebookPost->facebook_post_id,
+
+                'current_page' => $comments->currentPage(),
+                'per_page' => $comments->perPage(),
+                'total_comments' => $comments->total(),
+                'returned_count' => $comments->count(),
+                'analyzed_count' => $analyzedCount,
+                'unanalyzed_count' => max(
+                    $comments->count() - $analyzedCount,
+                    0,
+                ),
+            ],
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Canonical API Response
+        |--------------------------------------------------------------------------
+        */
+
+        return ApiResponse::success(
+            data: [
+                'comments' => $commentData,
+            ],
+            message: 'Facebook comments retrieved successfully.',
+            meta: [
+                'pagination' => $pagination,
+            ],
+        );
+    } catch (RuntimeException $exception) {
+        Log::error(
+            'Facebook comments index request failed.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'exception_class' => $exception::class,
+                'exception_message' =>
+                    $this->safeExceptionMessage($exception),
+            ],
+        );
+
+        report($exception);
+
+        return ApiResponse::serverError(
+            'Failed to retrieve Facebook comments.',
+        );
+    } catch (Throwable $exception) {
+        Log::critical(
+            'Unexpected failure retrieving Facebook comments.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'exception_class' => $exception::class,
+                'exception_message' =>
+                    $this->safeExceptionMessage($exception),
+            ],
+        );
+
+        report($exception);
+
+        return ApiResponse::serverError(
+            'Failed to retrieve Facebook comments.',
+        );
     }
+}
+
+
 
     /*
     |--------------------------------------------------------------------------

@@ -22,194 +22,435 @@ use RuntimeException;
 use Throwable;
 use App\Enums\FacebookSyncTrigger;
 use App\Enums\FacebookSyncType;
+use Illuminate\Validation\Rule;
+use App\Services\ApiResponse;
+use App\Models\FacebookComment;
+
 
 final class FacebookPostController extends Controller
 {
     /**
-     * Get all locally synchronized Facebook Page posts.
-     *
-     * GET /api/v1/facebook/pages/{facebookPage}/posts
-     *
-     * IMPORTANT:
-     * - This endpoint does NOT call Meta Graph API.
-     * - $facebookPage is the external Meta/Facebook Page ID.
-     * - Local posts are queried using facebook_pages.id.
-     */
-    public function index(
-        Request $request,
-        string $facebookPage,
-    ): JsonResponse {
-        $requestId = $this->requestId($request);
+ * Get locally synchronized Facebook Page posts.
+ *
+ * GET /api/v1/facebook/pages/{facebookPage}/posts
+ *
+ * Query parameters:
+ * - search: Search post message text.
+ * - sort_by: published_at | engagement
+ * - sort_direction: asc | desc
+ * - per_page: 1-100
+ * - page: Current page number
+ *
+ * IMPORTANT:
+ * - Does not call Meta Graph API.
+ * - $facebookPage is the external Meta/Facebook Page ID.
+ * - facebook_posts.facebook_page_id references facebook_pages.id.
+ */
 
-        Log::info('Facebook posts index request started.', [
-            'request_id' => $requestId,
-            'method' => $request->method(),
-            'path' => $request->path(),
-            'facebook_page_id_parameter' => $facebookPage,
-            'user_id' => $request->user()?->id,
-            'ip' => $request->ip(),
-        ]);
 
-        /*
-        |--------------------------------------------------------------------------
-        | Authentication
-        |--------------------------------------------------------------------------
-        */
 
-        $user = $request->user();
 
-        if ($user === null) {
-            Log::warning(
-                'Facebook posts index request rejected: unauthenticated.',
-                [
-                    'request_id' => $requestId,
-                    'facebook_page_id_parameter' => $facebookPage,
-                    'ip' => $request->ip(),
-                ],
-            );
+ public function index(
+    Request $request,
+    string $facebookPage,
+): JsonResponse {
+    $requestId = $this->requestId($request);
+    $user = $request->user();
 
-            return response()->json([
-                'success' => false,
-                'message' => 'Unauthenticated.',
-            ], Response::HTTP_UNAUTHORIZED);
-        }
+    /*
+    |--------------------------------------------------------------------------
+    | Authentication
+    |--------------------------------------------------------------------------
+    */
 
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination Validation
-        |--------------------------------------------------------------------------
-        */
-
-        $validated = $request->validate([
-            'per_page' => [
-                'sometimes',
-                'integer',
-                'min:1',
-                'max:100',
-            ],
-            'page' => [
-                'sometimes',
-                'integer',
-                'min:1',
-            ],
-        ]);
-
-        $perPage = (int) ($validated['per_page'] ?? 20);
-        $pageNumber = (int) ($validated['page'] ?? 1);
-
-        try {
-            /*
-            |--------------------------------------------------------------------------
-            | Resolve Page
-            |--------------------------------------------------------------------------
-            */
-
-            $page = $this->resolveUserPage(
-                userId: (string) $user->id,
-                facebookPageId: $facebookPage,
-                requestId: $requestId,
-            );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Query Local Posts
-            |--------------------------------------------------------------------------
-            |
-            | facebook_posts.facebook_page_id references the local
-            | facebook_pages.id UUID.
-            |
-            */
-
-            $posts = FacebookPost::query()
-                ->where(
-                    'facebook_page_id',
-                    $page->id,
-                )
-                ->with([
-                    'attachments.children',
-                    'comments',
-                    // 'topic',
-                ])
-                ->latest('published_at')
-                ->latest('created_at')
-                ->paginate(
-                    perPage: $perPage,
-                    page: $pageNumber,
-                );
-
-            Log::info('Facebook posts loaded successfully.', [
-                'request_id' => $requestId,
-                'user_id' => $user->id,
-                'page_internal_id' => $page->id,
-                'facebook_page_id' => $page->facebook_page_id,
-                'current_page' => $posts->currentPage(),
-                'per_page' => $posts->perPage(),
-                'total' => $posts->total(),
-                'from' => $posts->firstItem(),
-                'to' => $posts->lastItem(),
-            ]);
-
-            /*
-            |--------------------------------------------------------------------------
-            | Resource Transformation
-            |--------------------------------------------------------------------------
-            */
-
-            $postResources = FacebookPostResource::collection(
-                $posts->items(),
-            );
-
-            Log::debug('Facebook posts resource transformation completed.', [
-                'request_id' => $requestId,
-                'user_id' => $user->id,
-                'page_internal_id' => $page->id,
-                'items_returned' => count($posts->items()),
-            ]);
-
-            return response()->json([
-                'success' => true,
-
-                'data' => [
-                    'posts' => $postResources,
-
-                    'pagination' => [
-                        'current_page' => $posts->currentPage(),
-                        'per_page' => $posts->perPage(),
-                        'total' => $posts->total(),
-                        'last_page' => $posts->lastPage(),
-                        'from' => $posts->firstItem(),
-                        'to' => $posts->lastItem(),
-                    ],
-                ],
-            ]);
-        } catch (ModelNotFoundException $exception) {
-            Log::warning(
-                'Facebook posts index failed: Page not found for authenticated user.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user->id,
-                    'facebook_page_id_parameter' => $facebookPage,
-                    'exception_class' => $exception::class,
-                ],
-            );
-
-            throw $exception;
-        } catch (Throwable $exception) {
-            Log::error(
-                'Facebook posts index request failed unexpectedly.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user->id,
-                    'facebook_page_id_parameter' => $facebookPage,
-                    'exception_class' => $exception::class,
-                    'exception_message' => $exception->getMessage(),
-                    'exception_code' => $exception->getCode(),
-                ],
-            );
-
-            throw $exception;
-        }
+    if ($user === null) {
+        return ApiResponse::unauthorized();
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validate Query Parameters
+    |--------------------------------------------------------------------------
+    */
+
+    $validated = $request->validate([
+        'search' => [
+            'sometimes',
+            'nullable',
+            'string',
+            'max:255',
+        ],
+        'sort_by' => [
+            'sometimes',
+            'string',
+            Rule::in([
+                'published_at',
+                'engagement',
+            ]),
+        ],
+        'sort_direction' => [
+            'sometimes',
+            'string',
+            Rule::in([
+                'asc',
+                'desc',
+            ]),
+        ],
+        'per_page' => [
+            'sometimes',
+            'integer',
+            'min:1',
+            'max:100',
+        ],
+        'page' => [
+            'sometimes',
+            'integer',
+            'min:1',
+        ],
+    ]);
+
+    $search = trim((string) ($validated['search'] ?? ''));
+    $sortBy = $validated['sort_by'] ?? 'published_at';
+    $sortDirection = $validated['sort_direction'] ?? 'desc';
+    $perPage = (int) ($validated['per_page'] ?? 20);
+    $pageNumber = (int) ($validated['page'] ?? 1);
+
+    try {
+        /*
+        |--------------------------------------------------------------------------
+        | Resolve Accessible Facebook Page
+        |--------------------------------------------------------------------------
+        |
+        | $facebookPage is the external Meta Page ID.
+        | facebook_posts.facebook_page_id references facebook_pages.id.
+        |
+        */
+
+        $page = $this->resolveUserPage(
+            userId: (string) $user->id,
+            facebookPageId: $facebookPage,
+            requestId: $requestId,
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Base Query
+        |--------------------------------------------------------------------------
+        */
+
+        $query = FacebookPost::query()
+            ->where(
+                'facebook_posts.facebook_page_id',
+                $page->id,
+            )
+            ->with([
+                'attachments.children',
+                'comments',
+            ])
+            ->withCount('comments');
+
+        /*
+        |--------------------------------------------------------------------------
+        | Server-Side Search
+        |--------------------------------------------------------------------------
+        */
+
+        if ($search !== '') {
+            $query->where(
+                'facebook_posts.message',
+                'ILIKE',
+                '%' . $search . '%',
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Summary Across All Matching Posts
+        |--------------------------------------------------------------------------
+        |
+        | Calculate the summary before pagination.
+        | Use the stored post-level engagement counts.
+        |
+        */
+
+        $summaryQuery = clone $query;
+
+        $totalPosts = (int) (
+            (clone $summaryQuery)->count('facebook_posts.id')
+        );
+
+        $totalLikes = (int) (
+            (clone $summaryQuery)->sum('facebook_posts.like_count')
+        );
+
+        $totalComments = (int) (
+            (clone $summaryQuery)->sum('facebook_posts.comment_count')
+        );
+
+        $totalShares = (int) (
+            (clone $summaryQuery)->sum('facebook_posts.share_count')
+        );
+
+        $summary = [
+            'total_posts' => $totalPosts,
+            'total_likes' => $totalLikes,
+            'total_comments' => $totalComments,
+            'total_shares' => $totalShares,
+        ];
+
+        /*
+        |--------------------------------------------------------------------------
+        | Server-Side Sorting
+        |--------------------------------------------------------------------------
+        */
+
+        if ($sortBy === 'engagement') {
+            $query->orderByRaw(
+                '(
+                    COALESCE(facebook_posts.like_count, 0)
+                    + COALESCE(facebook_posts.comment_count, 0)
+                    + COALESCE(facebook_posts.share_count, 0)
+                ) ' . strtoupper($sortDirection)
+            );
+        } else {
+            $query->orderByRaw(
+                'facebook_posts.published_at '
+                . strtoupper($sortDirection)
+                . ' NULLS LAST'
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Stable Secondary Ordering
+        |--------------------------------------------------------------------------
+        */
+
+        $query->orderByDesc('facebook_posts.created_at')
+            ->orderByDesc('facebook_posts.id');
+
+        /*
+        |--------------------------------------------------------------------------
+        | Pagination
+        |--------------------------------------------------------------------------
+        */
+
+        $posts = $query->paginate(
+            perPage: $perPage,
+            page: $pageNumber,
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Logging
+        |--------------------------------------------------------------------------
+        */
+
+        Log::info('Facebook posts loaded successfully.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'page_internal_id' => $page->id,
+            'facebook_page_id' => $facebookPage,
+            'search_applied' => $search !== '',
+            'sort_by' => $sortBy,
+            'sort_direction' => $sortDirection,
+            'current_page' => $posts->currentPage(),
+            'per_page' => $posts->perPage(),
+            'total' => $posts->total(),
+            'summary' => $summary,
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | API Response
+        |--------------------------------------------------------------------------
+        */
+
+        return ApiResponse::success(
+            data: FacebookPostResource::collection(
+                $posts->getCollection(),
+            )->resolve($request),
+            message: 'Facebook posts retrieved successfully.',
+            meta: [
+                'pagination' => [
+                    'current_page' => $posts->currentPage(),
+                    'per_page' => $posts->perPage(),
+                    'total' => $posts->total(),
+                    'last_page' => $posts->lastPage(),
+                    'from' => $posts->firstItem(),
+                    'to' => $posts->lastItem(),
+                    'has_more' => $posts->hasMorePages(),
+                ],
+                'filters' => [
+                    'search' => $search !== '' ? $search : null,
+                    'sort_by' => $sortBy,
+                    'sort_direction' => $sortDirection,
+                ],
+            ],
+            summary: $summary,
+        );
+    } catch (ModelNotFoundException $exception) {
+        Log::warning(
+            'Facebook posts page not found for authenticated user.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_id' => $facebookPage,
+            ],
+        );
+
+        throw $exception;
+    } catch (Throwable $exception) {
+        Log::error('Facebook posts index failed.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'facebook_page_id' => $facebookPage,
+            'exception_class' => $exception::class,
+            'exception_message' => $exception->getMessage(),
+        ]);
+
+        throw $exception;
+    }
+}
+
+
+
+
+
+
+/**
+ * Get one locally synchronized Facebook Page post.
+ *
+ * GET /api/v1/facebook/pages/{facebookPage}/posts/{post}
+ *
+ * IMPORTANT:
+ * - $facebookPage is the external Meta/Facebook Page ID.
+ * - $post is the internal FacebookPost UUID.
+ * - The post must belong to the resolved page.
+ * - The authenticated user must have access to that page.
+ * - Does not call the Meta Graph API.
+ */
+public function show(
+    Request $request,
+    string $facebookPage,
+    string $post,
+): JsonResponse {
+    $requestId = $this->requestId($request);
+    $user = $request->user();
+
+    /*
+    |--------------------------------------------------------------------------
+    | Authentication
+    |--------------------------------------------------------------------------
+    */
+
+    if ($user === null) {
+        return ApiResponse::unauthorized();
+    }
+
+    try {
+        /*
+        |--------------------------------------------------------------------------
+        | Resolve Accessible Facebook Page
+        |--------------------------------------------------------------------------
+        */
+
+        $page = $this->resolveUserPage(
+            userId: (string) $user->id,
+            facebookPageId: $facebookPage,
+            requestId: $requestId,
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Retrieve Specific Post
+        |--------------------------------------------------------------------------
+        |
+        | facebookPage is the external Meta Page ID.
+        | facebook_posts.facebook_page_id references facebook_pages.id.
+        | post is the local FacebookPost primary key.
+        |
+        */
+
+        $facebookPost = FacebookPost::query()
+            ->where(
+                'facebook_posts.facebook_page_id',
+                $page->id,
+            )
+            ->where(
+                'facebook_posts.id',
+                $post,
+            )
+            ->with([
+                'attachments.children',
+                'comments',
+            ])
+            ->withCount('comments')
+            ->first();
+
+        if ($facebookPost === null) {
+            Log::notice('Facebook post not found for accessible page.', [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'page_internal_id' => $page->id,
+                'facebook_page_id' => $facebookPage,
+                'post_id' => $post,
+            ]);
+
+            return ApiResponse::notFound(
+                message: 'Facebook post not found.',
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Success Logging
+        |--------------------------------------------------------------------------
+        */
+
+        Log::info('Facebook post retrieved successfully.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'page_internal_id' => $page->id,
+            'facebook_page_id' => $facebookPage,
+            'post_id' => $facebookPost->getKey(),
+            'comments_count' => $facebookPost->comments_count,
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | API Response
+        |--------------------------------------------------------------------------
+        */
+
+        return ApiResponse::success(
+            data:  (new FacebookPostResource($facebookPost))
+                    ->resolve($request),
+            message: 'Facebook post retrieved successfully.',
+        );
+    } catch (ModelNotFoundException $exception) {
+        Log::warning('Facebook page not found for authenticated user.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'facebook_page_id' => $facebookPage,
+            'post_id' => $post,
+        ]);
+
+        throw $exception;
+    } catch (Throwable $exception) {
+        Log::error('Facebook post retrieval failed.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'facebook_page_id' => $facebookPage,
+            'post_id' => $post,
+            'exception_class' => $exception::class,
+            'exception_message' => $exception->getMessage(),
+        ]);
+
+        throw $exception;
+    }
+}
+
 
     /**
      * Queue Facebook Page post synchronization.
