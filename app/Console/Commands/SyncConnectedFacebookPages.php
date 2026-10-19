@@ -19,10 +19,11 @@ final class SyncConnectedFacebookPages extends Command
 {
     protected $signature = 'facebook:sync-connected-pages';
 
-    protected $description = 'Dispatch automatic synchronization jobs for monitored Facebook Pages.';
+    protected $description =
+        'Dispatch automatic synchronization jobs for monitored Facebook Pages.';
 
     /**
-     * Cache key used to track the last automatic Facebook synchronization.
+     * Cache key used to track the last successful automatic dispatch cycle.
      */
     private const LAST_SYNC_CACHE_KEY = 'facebook:last_automatic_sync_at';
 
@@ -39,9 +40,11 @@ final class SyncConnectedFacebookPages extends Command
 
     public function handle(): int
     {
+        $startedAt = now();
+
         Log::info('Facebook automatic synchronization command started.', [
             'command' => $this->getName(),
-            'started_at' => now()->toIso8601String(),
+            'started_at' => $startedAt->toIso8601String(),
         ]);
 
         /*
@@ -56,10 +59,8 @@ final class SyncConnectedFacebookPages extends Command
             $this->error('System settings could not be loaded.');
 
             Log::error(
-                'Facebook automatic synchronization skipped: system settings not found.',
-                [
-                    'command' => $this->getName(),
-                ]
+                'Facebook automatic synchronization failed: system settings not found.',
+                ['command' => $this->getName()],
             );
 
             return self::FAILURE;
@@ -67,92 +68,44 @@ final class SyncConnectedFacebookPages extends Command
 
         /*
         |--------------------------------------------------------------------------
-        | Scheduled Tasks
+        | Validate Synchronization Settings
         |--------------------------------------------------------------------------
         */
 
-        if (! $settings->scheduled_tasks_enabled) {
-            $this->info(
-                'Scheduled tasks are disabled. Facebook synchronization skipped.'
-            );
+        $disabledSettings = [
+            'scheduled_tasks_enabled' => $settings->scheduled_tasks_enabled,
+            'facebook_sync_enabled' => $settings->facebook_sync_enabled,
+            'facebook_auto_sync' => $settings->facebook_auto_sync,
+            'facebook_posts_enabled' => $settings->facebook_posts_enabled,
+        ];
 
-            Log::info(
-                'Facebook automatic synchronization skipped: scheduled tasks are disabled.',
-                [
-                    'scheduled_tasks_enabled' => false,
-                ]
-            );
+        foreach ($disabledSettings as $setting => $enabled) {
+            if (! $enabled) {
+                $message = match ($setting) {
+                    'scheduled_tasks_enabled' =>
+                        'Scheduled tasks are disabled. Facebook synchronization skipped.',
+                    'facebook_sync_enabled' =>
+                        'Facebook synchronization is disabled. Skipping.',
+                    'facebook_auto_sync' =>
+                        'Automatic Facebook synchronization is disabled. Skipping.',
+                    'facebook_posts_enabled' =>
+                        'Facebook post synchronization is disabled. Skipping.',
+                    default =>
+                        'Facebook synchronization skipped because a required setting is disabled.',
+                };
 
-            return self::SUCCESS;
-        }
+                $this->info($message);
 
-        /*
-        |--------------------------------------------------------------------------
-        | Facebook Integration
-        |--------------------------------------------------------------------------
-        */
+                Log::info(
+                    'Facebook automatic synchronization skipped because a required setting is disabled.',
+                    [
+                        'disabled_setting' => $setting,
+                        'settings' => $disabledSettings,
+                    ],
+                );
 
-        if (! $settings->facebook_sync_enabled) {
-            $this->info(
-                'Facebook synchronization is disabled. Skipping.'
-            );
-
-            Log::info(
-                'Facebook automatic synchronization skipped: Facebook synchronization is disabled.',
-                [
-                    'facebook_sync_enabled' => false,
-                ]
-            );
-
-            return self::SUCCESS;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Automatic Synchronization
-        |--------------------------------------------------------------------------
-        |
-        | This controls background synchronization only.
-        |
-        | Manual synchronization from the frontend/API is not affected by
-        | facebook_auto_sync.
-        |
-        */
-
-        if (! $settings->facebook_auto_sync) {
-            $this->info(
-                'Automatic Facebook synchronization is disabled. Skipping.'
-            );
-
-            Log::info(
-                'Facebook automatic synchronization skipped: automatic sync is disabled.',
-                [
-                    'facebook_auto_sync' => false,
-                ]
-            );
-
-            return self::SUCCESS;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Post Synchronization
-        |--------------------------------------------------------------------------
-        */
-
-        if (! $settings->facebook_posts_enabled) {
-            $this->info(
-                'Facebook post synchronization is disabled. Skipping.'
-            );
-
-            Log::info(
-                'Facebook automatic synchronization skipped: post synchronization is disabled.',
-                [
-                    'facebook_posts_enabled' => false,
-                ]
-            );
-
-            return self::SUCCESS;
+                return self::SUCCESS;
+            }
         }
 
         /*
@@ -160,28 +113,22 @@ final class SyncConnectedFacebookPages extends Command
         | Synchronization Interval
         |--------------------------------------------------------------------------
         |
-        | facebook_sync_interval is stored as minutes.
-        |
-        | Example:
-        |   5  = every 5 minutes
-        |   15 = every 15 minutes
-        |   30 = every 30 minutes
-        |   60 = every 60 minutes
+        | facebook_sync_interval is configured in minutes.
         |
         */
 
         $interval = (int) $settings->facebook_sync_interval;
 
         if ($interval <= 0) {
-            $interval = self::DEFAULT_SYNC_INTERVAL;
-
             Log::warning(
-                'Invalid Facebook synchronization interval. Falling back to default.',
+                'Invalid Facebook synchronization interval. Using the default.',
                 [
                     'configured_interval' => $settings->facebook_sync_interval,
                     'default_interval' => self::DEFAULT_SYNC_INTERVAL,
-                ]
+                ],
             );
+
+            $interval = self::DEFAULT_SYNC_INTERVAL;
         }
 
         /*
@@ -201,24 +148,24 @@ final class SyncConnectedFacebookPages extends Command
                     [
                         'last_sync_at' => $lastSyncAt,
                         'error' => $exception->getMessage(),
-                    ]
+                    ],
                 );
 
                 $lastSync = null;
             }
 
             if (
-                $lastSync !== null &&
-                $lastSync->diffInMinutes(now()) < $interval
+                $lastSync !== null
+                && $lastSync->diffInMinutes(now()) < $interval
             ) {
                 $nextSyncAt = $lastSync->copy()->addMinutes($interval);
 
-                $this->info(
-                    sprintf(
-                        'Facebook synchronization is not due yet. Next synchronization: %s.',
-                        $nextSyncAt->format('Y-m-d H:i:s')
-                    )
+                $message = sprintf(
+                    'Facebook synchronization is not due yet. Next synchronization: %s.',
+                    $nextSyncAt->format('Y-m-d H:i:s'),
                 );
+
+                $this->info($message);
 
                 Log::debug(
                     'Facebook automatic synchronization is not due yet.',
@@ -226,7 +173,7 @@ final class SyncConnectedFacebookPages extends Command
                         'last_sync_at' => $lastSync->toIso8601String(),
                         'next_sync_at' => $nextSyncAt->toIso8601String(),
                         'interval_minutes' => $interval,
-                    ]
+                    ],
                 );
 
                 return self::SUCCESS;
@@ -235,17 +182,20 @@ final class SyncConnectedFacebookPages extends Command
 
         /*
         |--------------------------------------------------------------------------
-        | Find Monitored Pages
+        | Find Eligible Facebook Pages
         |--------------------------------------------------------------------------
         |
-        | Only active Facebook Pages with an access token are eligible for
-        | automatic synchronization.
+        | IMPORTANT:
+        | The database column is access_token_encrypted, not access_token.
+        | The model or credential service remains responsible for handling
+        | the token value and decryption.
         |
         */
 
         $pages = FacebookPage::query()
             ->where('is_active', true)
-            ->whereNotNull('access_token');
+            ->whereNotNull('access_token_encrypted')
+            ->orderBy('id');
 
         $eligiblePages = 0;
         $dispatched = 0;
@@ -254,21 +204,11 @@ final class SyncConnectedFacebookPages extends Command
 
         /*
         |--------------------------------------------------------------------------
-        | Dispatch Synchronization Through Dispatcher
+        | Dispatch Synchronization Jobs
         |--------------------------------------------------------------------------
         |
-        | IMPORTANT:
-        |
-        | This command does NOT dispatch SyncFacebookPostsJob directly.
-        |
-        | The dispatcher:
-        |
-        |   1. validates the Page
-        |   2. creates FacebookSyncRun
-        |   3. sets trigger = scheduler
-        |   4. sets type = posts
-        |   5. selects the correct queue
-        |   6. dispatches the actual Queue Job
+        | The dispatcher is responsible for creating the sync run, selecting
+        | the queue, and dispatching the appropriate job.
         |
         */
 
@@ -289,7 +229,7 @@ final class SyncConnectedFacebookPages extends Command
                         'page_name' => $page->name,
                         'trigger' => FacebookSyncTrigger::SCHEDULER->value,
                         'type' => FacebookSyncType::POSTS->value,
-                    ]
+                    ],
                 );
 
                 $run = $this->syncDispatcher->dispatch(
@@ -317,74 +257,64 @@ final class SyncConnectedFacebookPages extends Command
                         'trigger' => $run->trigger->value,
                         'type' => $run->type->value,
                         'queue' => $run->queue,
-                    ]
+                    ],
                 );
             } catch (Throwable $exception) {
                 $failed++;
-
-                /*
-                |--------------------------------------------------------------------------
-                | Duplicate / Active Run
-                |--------------------------------------------------------------------------
-                |
-                | The dispatcher intentionally prevents more than one queued
-                | or running synchronization for the same Facebook Page.
-                |
-                | A page that already has an active synchronization should
-                | therefore be skipped rather than causing the entire scheduler
-                | command to fail.
-                |
-                */
-
                 $skipped++;
 
-                Log::warning(
-                    'Scheduled Facebook synchronization was skipped for a Page.',
+                Log::error(
+                    'Scheduled Facebook synchronization could not be dispatched.',
                     [
                         'facebook_page_uuid' => (string) $page->id,
                         'facebook_page_id' => $page->facebook_page_id,
                         'page_name' => $page->name,
                         'error' => $exception->getMessage(),
                         'exception' => $exception::class,
-                    ]
+                    ],
                 );
             }
         });
 
         /*
         |--------------------------------------------------------------------------
-        | Record Automatic Synchronization Time
+        | Record Dispatch Timestamp
         |--------------------------------------------------------------------------
         |
-        | Record the execution time even when there are currently no monitored
-        | pages. This prevents the scheduler from continuously treating the
-        | command as due every minute.
+        | Do not advance the automatic synchronization timestamp when eligible
+        | pages exist but none could be dispatched. This allows the next
+        | scheduler invocation to retry rather than waiting for the full interval.
+        |
+        | If there are no eligible pages, record the timestamp to avoid querying
+        | continuously when the scheduler runs every minute.
         |
         */
 
-        $executedAt = now();
+        if ($eligiblePages === 0 || $dispatched > 0) {
+            $executedAt = now();
 
-        Cache::forever(
-            self::LAST_SYNC_CACHE_KEY,
-            $executedAt->toIso8601String()
-        );
+            Cache::forever(
+                self::LAST_SYNC_CACHE_KEY,
+                $executedAt->toIso8601String(),
+            );
+        }
 
         /*
         |--------------------------------------------------------------------------
-        | Result
+        | Report Results
         |--------------------------------------------------------------------------
         */
 
-        $this->info(
-            sprintf(
-                'Facebook synchronization dispatch completed. Eligible pages: %d. Dispatched: %d. Skipped: %d. Failed: %d. Interval: %d minute(s).',
-                $eligiblePages,
-                $dispatched,
-                $skipped,
-                $failed,
-                $interval
-            )
+        $summary = sprintf(
+            'Facebook synchronization dispatch completed. Eligible pages: %d. Dispatched: %d. Skipped: %d. Failed: %d. Interval: %d minute(s).',
+            $eligiblePages,
+            $dispatched,
+            $skipped,
+            $failed,
+            $interval,
         );
+
+        $this->info($summary);
 
         Log::info(
             'Facebook automatic synchronization command completed.',
@@ -394,21 +324,13 @@ final class SyncConnectedFacebookPages extends Command
                 'skipped' => $skipped,
                 'failed' => $failed,
                 'interval_minutes' => $interval,
-                'executed_at' => $executedAt->toIso8601String(),
-            ]
+                'started_at' => $startedAt->toIso8601String(),
+                'completed_at' => now()->toIso8601String(),
+            ],
         );
 
-        /*
-        |--------------------------------------------------------------------------
-        | Command Result
-        |--------------------------------------------------------------------------
-        |
-        | A synchronization failure for one Page should not necessarily make
-        | the entire scheduler command fail. The individual Page/run contains
-        | its own failure state and can be monitored independently.
-        |
-        */
-
-        return self::SUCCESS;
+        return $failed > 0 && $dispatched === 0 && $eligiblePages > 0
+            ? self::FAILURE
+            : self::SUCCESS;
     }
 }
