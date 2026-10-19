@@ -46,12 +46,13 @@ jobs:
 
           script: |
             set -eu
+            umask 077
 
             APP_DIR="${DEPLOY_PATH:-/opt/asi-platform/apps/facebook-sentiment-api}"
             BACKUP_DIR="/opt/asi-platform/backups/facebook-sentiment-api"
 
             WORKER_STOPPED=0
-            DEPLOY_SUCCEEDED=0
+            CURRENT_STEP="Initializing deployment"
 
             echo "=========================================="
             echo "Mayor Sentiment API Deployment"
@@ -66,7 +67,6 @@ jobs:
 
             cd "$APP_DIR"
 
-            # Resolve Docker Compose configuration.
             if [ -f compose.yaml ]; then
               COMPOSE_FILE="compose.yaml"
             elif [ -f compose.yml ]; then
@@ -84,46 +84,69 @@ jobs:
               docker compose -f "$COMPOSE_FILE" "$@"
             }
 
-            # Report the failing step and preserve service availability.
             on_exit() {
               STATUS=$?
 
               if [ "$STATUS" -ne 0 ]; then
+                trap - EXIT
+                set +e
+
                 echo ""
                 echo "=========================================="
-                echo "DEPLOYMENT FAILED: exit code $STATUS"
+                echo "DEPLOYMENT FAILED"
+                echo "Exit code: $STATUS"
+                echo "Last step: $CURRENT_STEP"
                 echo "=========================================="
 
                 echo ""
                 echo "--- Container status ---"
-                dc ps || true
+                dc ps
 
                 echo ""
                 echo "--- Recent application logs ---"
                 dc logs --tail=100 \
-                  app nginx queue-worker postgres redis 2>&1 || true
+                  app nginx queue-worker postgres redis
 
                 if [ "$WORKER_STOPPED" -eq 1 ]; then
                   echo ""
-                  echo "--- Recovering queue worker ---"
+                  echo "--- Attempting queue-worker recovery ---"
 
                   if dc up -d queue-worker; then
-                    echo "Queue worker restart command completed."
+                    WORKER_CONTAINER="$(dc ps -q queue-worker)"
+
+                    if [ -n "$WORKER_CONTAINER" ]; then
+                      WORKER_STATE="$(
+                        docker inspect \
+                          --format '{{.State.Status}}' \
+                          "$WORKER_CONTAINER" 2>/dev/null
+                      )"
+
+                      if [ "$WORKER_STATE" = "running" ]; then
+                        echo "Queue worker recovery succeeded."
+                      else
+                        echo "WARNING: Queue worker state: $WORKER_STATE"
+                        dc logs --tail=100 queue-worker
+                      fi
+                    else
+                      echo "WARNING: Queue worker container was not found."
+                    fi
                   else
-                    echo "WARNING: Queue worker restart failed."
+                    echo "WARNING: Queue worker recovery failed."
                   fi
                 fi
 
                 echo ""
                 echo "No automatic database rollback was attempted."
-                echo "Inspect migration status before retrying."
+                echo "Check migration status before retrying."
               fi
 
+              trap - EXIT
               exit "$STATUS"
             }
 
             trap on_exit EXIT
 
+            CURRENT_STEP="Checking deployment prerequisites"
             echo ""
             echo "1. Checking deployment prerequisites..."
 
@@ -131,19 +154,19 @@ jobs:
             docker compose version
 
             if ! docker network inspect traefik-public >/dev/null 2>&1; then
-              echo "ERROR: Required network traefik-public is missing."
+              echo "ERROR: Docker network traefik-public is missing."
               exit 1
             fi
 
             if [ ! -f .env ] || [ ! -f .env.postgres ]; then
-              echo "ERROR: Runtime environment files are missing."
+              echo "ERROR: Required .env or .env.postgres is missing."
               exit 1
             fi
 
             chmod 600 .env .env.postgres
 
             case "${RUN_SEEDERS:-false}" in
-              true|false|"")
+              true|false)
                 ;;
               *)
                 echo "ERROR: RUN_SEEDERS must be true or false."
@@ -151,29 +174,46 @@ jobs:
                 ;;
             esac
 
+            CURRENT_STEP="Validating repository state"
             echo ""
             echo "2. Validating repository state..."
 
             CURRENT_BRANCH="$(git branch --show-current)"
 
             if [ "$CURRENT_BRANCH" != "main" ]; then
-              echo "ERROR: Expected main branch, found $CURRENT_BRANCH."
+              echo "ERROR: Expected main branch, found '$CURRENT_BRANCH'."
               exit 1
             fi
 
-            if [ -n "$(git status --porcelain)" ]; then
+            if git ls-files --error-unmatch .env.postgres >/dev/null 2>&1; then
+              echo "ERROR: .env.postgres must not be tracked by Git."
+              exit 1
+            fi
+
+            # Exclude only this server-specific environment file.
+            # Never add production secrets to the repository.
+            EXCLUDE_FILE="$(git rev-parse --git-path info/exclude)"
+            touch "$EXCLUDE_FILE"
+
+            if ! grep -qxF '/.env.postgres' "$EXCLUDE_FILE"; then
+              printf '\n/.env.postgres\n' >> "$EXCLUDE_FILE"
+            fi
+
+            if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
               echo "ERROR: Git working tree is not clean."
               git status --short
               exit 1
             fi
 
+            CURRENT_STEP="Fetching and updating main"
             echo ""
             echo "3. Fetching the latest main branch..."
 
             git fetch --prune origin main
 
-            if [ -n "$(git status --porcelain)" ]; then
+            if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
               echo "ERROR: Working tree changed during fetch."
+              git status --short
               exit 1
             fi
 
@@ -184,6 +224,7 @@ jobs:
             echo "Deploying commit: $DEPLOY_COMMIT"
             git log -1 --format='%h %s'
 
+            CURRENT_STEP="Validating application files"
             echo ""
             echo "4. Validating required application files..."
 
@@ -201,21 +242,25 @@ jobs:
               fi
             done
 
+            CURRENT_STEP="Validating Docker Compose configuration"
             echo ""
             echo "5. Validating Docker Compose configuration..."
 
             dc config --quiet
 
+            CURRENT_STEP="Building production images"
             echo ""
             echo "6. Building production images..."
 
             dc build app nginx
 
+            CURRENT_STEP="Starting PostgreSQL and Redis"
             echo ""
             echo "7. Starting PostgreSQL and Redis..."
 
             dc up -d postgres redis
 
+            CURRENT_STEP="Waiting for PostgreSQL"
             echo ""
             echo "8. Waiting for PostgreSQL..."
 
@@ -236,35 +281,42 @@ jobs:
 
             echo "PostgreSQL is accepting connections."
 
+            CURRENT_STEP="Checking Redis"
             echo ""
             echo "9. Checking Redis..."
 
             ATTEMPTS=0
+            REDIS_READY=0
 
-            until dc exec -T redis redis-cli ping 2>/dev/null |
-              grep -q '^PONG$'; do
-              ATTEMPTS=$((ATTEMPTS + 1))
-
-              if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
-                echo "ERROR: Redis did not become ready."
-                dc logs --tail=100 redis
-                exit 1
+            while [ "$ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; do
+              if dc exec -T redis redis-cli ping 2>/dev/null |
+                grep -q '^PONG$'; then
+                REDIS_READY=1
+                break
               fi
 
+              ATTEMPTS=$((ATTEMPTS + 1))
               sleep 2
             done
 
+            if [ "$REDIS_READY" -ne 1 ]; then
+              echo "ERROR: Redis did not become ready."
+              dc logs --tail=100 redis
+              exit 1
+            fi
+
             echo "Redis is responding."
 
+            CURRENT_STEP="Stopping queue worker"
             echo ""
             echo "10. Stopping the queue worker..."
 
-            # Avoid processing jobs with old code during deployment.
             dc stop queue-worker
             WORKER_STOPPED=1
 
+            CURRENT_STEP="Starting Laravel application"
             echo ""
-            echo "11. Starting the updated Laravel application..."
+            echo "11. Starting the Laravel application..."
 
             dc up -d app
 
@@ -275,6 +327,7 @@ jobs:
               exit 1
             fi
 
+            CURRENT_STEP="Waiting for Laravel health"
             echo ""
             echo "12. Waiting for Laravel health..."
 
@@ -305,21 +358,23 @@ jobs:
             done
 
             if [ "$APP_STATUS" != "healthy" ]; then
-              echo "ERROR: Timed out waiting for Laravel."
+              echo "ERROR: Timed out waiting for Laravel health."
               dc logs --tail=100 app
               exit 1
             fi
 
             echo "Laravel is healthy."
 
+            CURRENT_STEP="Rebuilding Laravel caches"
             echo ""
-            echo "13. Clearing and rebuilding Laravel caches..."
+            echo "13. Rebuilding Laravel caches..."
 
             dc exec -T app php artisan optimize:clear
             dc exec -T app php artisan package:discover --ansi
             dc exec -T app php artisan config:cache
             dc exec -T app php artisan view:cache
 
+            CURRENT_STEP="Backing up PostgreSQL"
             echo ""
             echo "14. Backing up PostgreSQL before migrations..."
 
@@ -328,30 +383,32 @@ jobs:
 
             BACKUP_FILE="$BACKUP_DIR/adama-civic-intelligence-$(date -u +%Y%m%dT%H%M%SZ).sql"
 
-            # Keep pg_dump output separate from SSH diagnostic output.
-            if ! dc exec -T postgres sh -c \
-              'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' \
+            if ! dc exec -T postgres sh -ec \
+              'test -n "${POSTGRES_USER:-}" &&
+               test -n "${POSTGRES_DB:-}" &&
+               pg_dump --no-owner --no-privileges \
+                 -U "$POSTGRES_USER" "$POSTGRES_DB"' \
               > "$BACKUP_FILE"; then
               rm -f "$BACKUP_FILE"
-              echo "ERROR: Database backup failed."
+              echo "ERROR: PostgreSQL backup command failed."
               exit 1
             fi
 
             if [ ! -s "$BACKUP_FILE" ]; then
               rm -f "$BACKUP_FILE"
-              echo "ERROR: Database backup is empty."
+              echo "ERROR: PostgreSQL backup is empty."
               exit 1
             fi
 
             chmod 600 "$BACKUP_FILE"
 
-            echo "Database backup created: $BACKUP_FILE"
+            echo "Database backup created successfully."
             ls -lh "$BACKUP_FILE"
 
+            CURRENT_STEP="Running production migrations"
             echo ""
             echo "15. Running production migrations..."
 
-            # Verbose output helps identify the failing migration.
             if ! dc exec -T app php artisan migrate --force -vvv; then
               echo "ERROR: Laravel production migrations failed."
               echo "Current migration status follows."
@@ -364,28 +421,28 @@ jobs:
 
             echo "Production migrations completed."
 
+            CURRENT_STEP="Running optional production seeders"
             echo ""
             echo "16. Running optional production seeders..."
 
-            case "${RUN_SEEDERS:-false}" in
-              true)
-                echo "Seeder execution explicitly enabled."
+            if [ "${RUN_SEEDERS:-false}" = "true" ]; then
+              echo "Seeder execution explicitly enabled."
 
-                if ! dc exec -T app php artisan db:seed --force; then
-                  echo "ERROR: Production database seeders failed."
-                  exit 1
-                fi
-                ;;
-              false|"")
-                echo "Skipping seeders."
-                ;;
-            esac
+              if ! dc exec -T app php artisan db:seed --force; then
+                echo "ERROR: Production database seeders failed."
+                exit 1
+              fi
+            else
+              echo "Seeders skipped."
+            fi
 
+            CURRENT_STEP="Starting updated Nginx"
             echo ""
             echo "17. Starting updated Nginx..."
 
             dc up -d nginx
 
+            CURRENT_STEP="Checking Nginx health"
             echo ""
             echo "18. Checking Nginx health..."
 
@@ -413,6 +470,7 @@ jobs:
 
             echo "Nginx health check passed."
 
+            CURRENT_STEP="Testing Laravel API"
             echo ""
             echo "19. Testing the Laravel API..."
 
@@ -432,7 +490,9 @@ jobs:
             fi
 
             echo "API smoke test passed."
+            printf '%s\n' "$API_RESPONSE"
 
+            CURRENT_STEP="Restarting and verifying queue worker"
             echo ""
             echo "20. Restarting the updated queue worker..."
 
@@ -444,8 +504,6 @@ jobs:
               echo "ERROR: Queue worker container was not created."
               exit 1
             fi
-
-            WORKER_STOPPED=0
 
             WORKER_STATE="$(
               docker inspect \
@@ -459,8 +517,10 @@ jobs:
               exit 1
             fi
 
+            WORKER_STOPPED=0
             echo "Queue worker is running."
 
+            CURRENT_STEP="Final service verification"
             echo ""
             echo "21. Final service status..."
 
@@ -475,5 +535,4 @@ jobs:
             echo "Deployment completed successfully."
             echo "=========================================="
 
-            DEPLOY_SUCCEEDED=1
             trap - EXIT
