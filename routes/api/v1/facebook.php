@@ -251,5 +251,30 @@ Route::prefix('facebook')->group(function (): void {
                 '/{facebookPageId}/posts/{facebookPostId}/comments/sync',
                 [FacebookCommentController::class, 'sync']
             )->name('facebook.pages.posts.comments.sync');
+
+            /*
+            |--------------------------------------------------------------------------
+            | Facebook Post Comment Insights
+            |--------------------------------------------------------------------------
+            |
+            | Retrieve the most-liked positive and negative top-level comments
+            | for a specific saved Facebook Post.
+            |
+            | Reads persisted comment sentiment analysis from the local database.
+            | Does not call Meta or trigger AI analysis.
+            |
+            | Optional query parameters:
+            |     start_date=2026-10-01
+            |     end_date=2026-10-22
+            |
+            | GET /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments/insights
+            |--------------------------------------------------------------------------
+            */
+
+            Route::get(
+                '/{facebookPageId}/posts/{facebookPostId}/comments/insights',
+                [FacebookCommentController::class, 'insights']
+            )->whereUuid('facebookPostId')
+                ->name('facebook.pages.posts.comments.insights');
         });
 });

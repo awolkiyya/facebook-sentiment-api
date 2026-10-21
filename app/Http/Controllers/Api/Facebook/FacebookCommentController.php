@@ -23,6 +23,9 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use RuntimeException;
 use Throwable;
+use App\Services\Facebook\FacebookPostCommentInsightsService;
+use Carbon\CarbonImmutable;
+use Illuminate\Support\Facades\Validator;
 
 final class FacebookCommentController extends Controller
 {
@@ -1428,4 +1431,171 @@ final class FacebookCommentController extends Controller
             5000,
         );
     }
+
+/**
+ * Return the most-liked positive and negative comments for one post.
+ *
+ * GET:
+ * /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments/insights
+ */
+public function insights(
+    Request $request,
+    FacebookPostCommentInsightsService $insightsService,
+): JsonResponse {
+    $requestId = $this->requestId($request);
+    $user = $request->user();
+
+    if ($user === null) {
+        return ApiResponse::unauthorized(
+            'Authentication is required.',
+        );
+    }
+
+    $facebookPageId = trim(
+        (string) $request->route('facebookPageId'),
+    );
+
+    $facebookPostId = trim(
+        (string) $request->route('facebookPostId'),
+    );
+
+    $validator = Validator::make($request->query(), [
+        'start_date' => [
+            'sometimes',
+            'nullable',
+            'date_format:Y-m-d',
+        ],
+        'end_date' => [
+            'sometimes',
+            'nullable',
+            'date_format:Y-m-d',
+        ],
+    ]);
+
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'The supplied date filters are invalid.',
+            'errors' => $validator->errors(),
+            'request_id' => $requestId,
+        ], Response::HTTP_UNPROCESSABLE_ENTITY);
+    }
+
+    $filters = $validator->validated();
+
+    $startDate = $filters['start_date'] ?? null;
+    $endDate = $filters['end_date'] ?? null;
+
+    if (
+        $startDate !== null
+        && $endDate !== null
+        && $endDate < $startDate
+    ) {
+        return response()->json([
+            'success' => false,
+            'message' => 'end_date must be on or after start_date.',
+            'errors' => [
+                'end_date' => [
+                    'The end date must be on or after the start date.',
+                ],
+            ],
+            'request_id' => $requestId,
+        ], Response::HTTP_UNPROCESSABLE_ENTITY);
+    }
+
+    try {
+        $page = $this->resolveUserPage(
+            userId: (string) $user->id,
+            facebookPageId: $facebookPageId,
+            requestId: $requestId,
+        );
+
+        $post = $this->resolvePost(
+            page: $page,
+            facebookPostId: $facebookPostId,
+            requestId: $requestId,
+        );
+
+        $startAt = $startDate !== null
+            ? CarbonImmutable::parse($startDate)->startOfDay()
+            : null;
+
+        // Exclusive next-day boundary includes the entire end date.
+        $endExclusive = $endDate !== null
+            ? CarbonImmutable::parse($endDate)
+                ->addDay()
+                ->startOfDay()
+            : null;
+
+        $topPositive = $insightsService->mostLikedComment(
+            post: $post,
+            sentiment: 'positive',
+            startAt: $startAt,
+            endExclusive: $endExclusive,
+        );
+
+        $topNegative = $insightsService->mostLikedComment(
+            post: $post,
+            sentiment: 'negative',
+            startAt: $startAt,
+            endExclusive: $endExclusive,
+        );
+
+        Log::info('Facebook post comment insights retrieved.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'facebook_page_internal_id' => $page->id,
+            'facebook_post_internal_id' => $post->id,
+            'start_date' => $startDate,
+            'end_date' => $endDate,
+            'has_top_positive' => $topPositive !== null,
+            'has_top_negative' => $topNegative !== null,
+        ]);
+
+        return ApiResponse::success(
+            data: [
+                'top_positive' => $topPositive,
+                'top_negative' => $topNegative,
+            ],
+            message: 'Facebook post comment insights retrieved successfully.',
+            meta: [
+                'post_id' => $post->id,
+                'period' => [
+                    'start_date' => $startDate,
+                    'end_date' => $endDate,
+                ],
+            ],
+        );
+    } catch (RuntimeException $exception) {
+        Log::warning('Facebook post comment insights could not resolve resources.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'facebook_page_id' => $facebookPageId,
+            'facebook_post_id' => $facebookPostId,
+            'exception_class' => $exception::class,
+            'exception_message' => $this->safeExceptionMessage($exception),
+        ]);
+
+        return response()->json([
+            'success' => false,
+            'message' => $exception->getMessage(),
+            'request_id' => $requestId,
+        ], Response::HTTP_NOT_FOUND);
+    } catch (Throwable $exception) {
+        Log::error('Facebook post comment insights request failed.', [
+            'request_id' => $requestId,
+            'user_id' => $user->id,
+            'facebook_page_id' => $facebookPageId,
+            'facebook_post_id' => $facebookPostId,
+            'exception_class' => $exception::class,
+            'exception_message' => $this->safeExceptionMessage($exception),
+        ]);
+
+        report($exception);
+
+        return ApiResponse::serverError(
+            'Failed to retrieve Facebook post comment insights.',
+        );
+    }
+}
 }
