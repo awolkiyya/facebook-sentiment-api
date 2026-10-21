@@ -206,6 +206,7 @@ final class FacebookCommentController extends Controller
 
             $comments = $commentQueryService->paginateForPost(
                 post: $facebookPost,
+                filters: $filters,
                 perPage: $perPage,
                 page: $pageNumber,
             );
