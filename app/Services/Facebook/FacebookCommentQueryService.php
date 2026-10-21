@@ -14,12 +14,19 @@ final class FacebookCommentQueryService
     private const MAX_PER_PAGE = 100;
 
     /**
-     * Retrieve all locally stored comments belonging to an authorized post.
+     * Paginate top-level comments belonging to an authorized post.
      *
-     * No search, sentiment, language, analysis-status, or date filters
-     * are applied. Pagination and sorting are retained.
+     * Replies are retrieved separately when a user expands a thread.
      *
-     * This method does not call Meta or execute AI inference.
+     * This method reads only locally persisted data. It does not call Meta
+     * or execute AI inference.
+     *
+     * Currently supported:
+     * - Sorting
+     * - Pagination
+     *
+     * Search, sentiment, language, analysis-status, and date filtering
+     * are intentionally not applied by this service.
      *
      * @param array<string, mixed> $filters
      */
@@ -37,6 +44,7 @@ final class FacebookCommentQueryService
                 'facebook_comments.facebook_post_id',
                 $post->getKey(),
             )
+            ->whereNull('facebook_comments.parent_comment_id')
             ->with('latestSentimentAnalysis');
 
         $this->applySorting(

@@ -14,7 +14,9 @@ class FacebookCommentResource extends JsonResource
      */
     public function toArray(Request $request): array
     {
-        $sentimentAnalysis = $this->latestSentimentAnalysis;
+        $sentimentAnalysis = $this->whenLoaded(
+            'latestSentimentAnalysis',
+        );
 
         return [
             /*
@@ -28,6 +30,18 @@ class FacebookCommentResource extends JsonResource
             'facebook_comment_id' => $this->facebook_comment_id,
 
             'parent_comment_id' => $this->parent_comment_id,
+
+            /*
+            |--------------------------------------------------------------------------
+            | Thread
+            |--------------------------------------------------------------------------
+            |
+            | replies_count is included when the query uses withCount('replies').
+            | It represents direct replies, not all nested descendants.
+            |
+            */
+
+            'replies_count' => $this->whenCounted('replies'),
 
             /*
             |--------------------------------------------------------------------------
@@ -56,9 +70,6 @@ class FacebookCommentResource extends JsonResource
             |--------------------------------------------------------------------------
             | Comment Engagement
             |--------------------------------------------------------------------------
-            |
-            | Return only metrics actually collected and persisted.
-            |
             */
 
             'engagement' => [
@@ -73,35 +84,21 @@ class FacebookCommentResource extends JsonResource
 
             'ai_analysis' => $sentimentAnalysis
                 ? [
-                    /*
-                     * Sentiment classification
-                     */
                     'sentiment' => [
                         'label' => $sentimentAnalysis->sentiment,
-
                         'confidence' => $sentimentAnalysis->confidence,
                     ],
 
-                    /*
-                     * Language detection
-                     */
                     'language' => $sentimentAnalysis->language,
-                    'language_confidence' => $sentimentAnalysis->language_confidence,
 
-                    /*
-                     * Civic topic classification
-                     *
-                     * Topic values are supplied by the AI service.
-                     * Laravel does not enforce a fixed topic vocabulary.
-                     */
+                    'language_confidence' =>
+                        $sentimentAnalysis->language_confidence,
+
                     'topic' => $sentimentAnalysis->topic,
 
                     'topic_confidence' =>
                         $sentimentAnalysis->topic_confidence,
 
-                    /*
-                     * Priority classification
-                     */
                     'priority' => $sentimentAnalysis->priority,
 
                     'priority_confidence' =>
