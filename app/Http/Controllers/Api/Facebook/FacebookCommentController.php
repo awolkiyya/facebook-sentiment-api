@@ -26,7 +26,7 @@ use Throwable;
 
 final class FacebookCommentController extends Controller
 {
-    /*
+      /*
     |--------------------------------------------------------------------------
     | Configuration
     |--------------------------------------------------------------------------
@@ -41,6 +41,17 @@ final class FacebookCommentController extends Controller
      * Default number of comments returned by one request.
      */
     private const DEFAULT_PER_PAGE = 20;
+
+    /**
+     * Queue used for Facebook comment synchronization.
+     */
+    private const COMMENT_SYNC_QUEUE = 'facebook-comments';
+
+    /**
+     * Synchronization run type.
+     */
+    private const SYNC_RUN_TYPE = 'comments';
+
 
     /*
     |--------------------------------------------------------------------------
