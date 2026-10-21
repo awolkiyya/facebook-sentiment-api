@@ -80,14 +80,6 @@ class FacebookCommentResource extends JsonResource
                         'label' => $sentimentAnalysis->sentiment,
 
                         'confidence' => $sentimentAnalysis->confidence,
-
-                        'scores' => [
-                            'positive' => $sentimentAnalysis->positive_score,
-
-                            'neutral' => $sentimentAnalysis->neutral_score,
-
-                            'negative' => $sentimentAnalysis->negative_score,
-                        ],
                     ],
 
                     /*
@@ -113,18 +105,6 @@ class FacebookCommentResource extends JsonResource
 
                     'priority_confidence' =>
                         $sentimentAnalysis->priority_confidence,
-
-                    /*
-                     * Processing metadata
-                     */
-                    'processing_time_ms' =>
-                        $sentimentAnalysis->processing_time_ms,
-
-                    'analyzed_at' =>
-                        $sentimentAnalysis->analyzed_at?->toISOString(),
-
-                    'sentiment_model_version_id' =>
-                        $sentimentAnalysis->sentiment_model_version_id,
                 ]
                 : null,
 
