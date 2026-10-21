@@ -23,10 +23,10 @@ class SentimentAnalysis extends Model
         'facebook_comment_id',
         'sentiment_model_version_id',
 
-        /*
-         * Language
-         */
+        // Language
         'language',
+        'language_confidence',
+
 
         /*
          * Sentiment
@@ -62,6 +62,8 @@ class SentimentAnalysis extends Model
      */
     protected $casts = [
         'confidence' => 'float',
+
+        'language_confidence' => 'float',
 
         'positive_score' => 'float',
         'neutral_score' => 'float',

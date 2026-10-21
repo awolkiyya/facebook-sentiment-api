@@ -56,9 +56,6 @@ class FacebookCommentResource extends JsonResource
             |--------------------------------------------------------------------------
             | Comment Engagement
             |--------------------------------------------------------------------------
-            |
-            | Return only metrics actually collected and persisted.
-            |
             */
 
             'engagement' => [
@@ -78,20 +75,19 @@ class FacebookCommentResource extends JsonResource
                      */
                     'sentiment' => [
                         'label' => $sentimentAnalysis->sentiment,
-
                         'confidence' => $sentimentAnalysis->confidence,
                     ],
 
                     /*
                      * Language detection
                      */
-                    'language' => $sentimentAnalysis->language,
+                    'language' => [
+                        'code' => $sentimentAnalysis->language,
+                        'confidence' => $sentimentAnalysis->language_confidence,
+                    ],
 
                     /*
                      * Civic topic classification
-                     *
-                     * Topic values are supplied by the AI service.
-                     * Laravel does not enforce a fixed topic vocabulary.
                      */
                     'topic' => $sentimentAnalysis->topic,
 
