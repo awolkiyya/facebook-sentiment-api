@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Resources;
 
+use App\Models\SentimentAnalysis;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -14,9 +15,51 @@ class FacebookCommentResource extends JsonResource
      */
     public function toArray(Request $request): array
     {
-        $sentimentAnalysis = $this->whenLoaded(
+        /*
+        |--------------------------------------------------------------------------
+        | Latest Sentiment Analysis
+        |--------------------------------------------------------------------------
+        |
+        | Only serialize the relationship when it has already been loaded.
+        | This avoids additional database queries during serialization.
+        |
+        */
+
+        $sentimentAnalysis = $this->resource->relationLoaded(
             'latestSentimentAnalysis',
-        );
+        )
+            ? $this->resource->getRelation('latestSentimentAnalysis')
+            : null;
+
+        /*
+        |--------------------------------------------------------------------------
+        | AI Analysis
+        |--------------------------------------------------------------------------
+        */
+
+        $aiAnalysis = $sentimentAnalysis instanceof SentimentAnalysis
+            ? [
+                'sentiment' => [
+                    'label' => $sentimentAnalysis->sentiment,
+                    'confidence' => $sentimentAnalysis->confidence,
+                ],
+
+                'language' => $sentimentAnalysis->language,
+
+                'language_confidence' =>
+                    $sentimentAnalysis->language_confidence,
+
+                'topic' => $sentimentAnalysis->topic,
+
+                'topic_confidence' =>
+                    $sentimentAnalysis->topic_confidence,
+
+                'priority' => $sentimentAnalysis->priority,
+
+                'priority_confidence' =>
+                    $sentimentAnalysis->priority_confidence,
+            ]
+            : null;
 
         return [
             /*
@@ -35,10 +78,6 @@ class FacebookCommentResource extends JsonResource
             |--------------------------------------------------------------------------
             | Thread
             |--------------------------------------------------------------------------
-            |
-            | replies_count is included when the query uses withCount('replies').
-            | It represents direct replies, not all nested descendants.
-            |
             */
 
             'replies_count' => $this->whenCounted('replies'),
@@ -68,7 +107,7 @@ class FacebookCommentResource extends JsonResource
 
             /*
             |--------------------------------------------------------------------------
-            | Comment Engagement
+            | Engagement
             |--------------------------------------------------------------------------
             */
 
@@ -82,29 +121,7 @@ class FacebookCommentResource extends JsonResource
             |--------------------------------------------------------------------------
             */
 
-            'ai_analysis' => $sentimentAnalysis
-                ? [
-                    'sentiment' => [
-                        'label' => $sentimentAnalysis->sentiment,
-                        'confidence' => $sentimentAnalysis->confidence,
-                    ],
-
-                    'language' => $sentimentAnalysis->language,
-
-                    'language_confidence' =>
-                        $sentimentAnalysis->language_confidence,
-
-                    'topic' => $sentimentAnalysis->topic,
-
-                    'topic_confidence' =>
-                        $sentimentAnalysis->topic_confidence,
-
-                    'priority' => $sentimentAnalysis->priority,
-
-                    'priority_confidence' =>
-                        $sentimentAnalysis->priority_confidence,
-                ]
-                : null,
+            'ai_analysis' => $aiAnalysis,
 
             /*
             |--------------------------------------------------------------------------
