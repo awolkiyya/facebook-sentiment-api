@@ -64,14 +64,28 @@ final class ListFacebookCommentsRequest extends FormRequest
             ],
 
             /*
-             * Only expose statuses that the current controller
-             * can actually filter correctly.
+             * Filter commenters by their comment count
+             * on the current Facebook post.
              *
-             * "pending" means no persisted analysis exists.
-             * "completed" means a persisted analysis exists.
+             * repeat: authors with at least two comments.
+             * single: authors with exactly one comment.
              *
-             * Add "processing" and "failed" only after implementing
-             * persistent status tracking and filtering.
+             * Omit the parameter to include all commenters.
+             */
+            'commenter' => [
+                'sometimes',
+                Rule::in([
+                    'repeat',
+                    'single',
+                ]),
+            ],
+
+            /*
+             * Only expose statuses that the controller
+             * can filter correctly.
+             *
+             * pending: no persisted analysis exists.
+             * completed: a persisted analysis exists.
              */
             'analysis_status' => [
                 'sometimes',
@@ -83,8 +97,8 @@ final class ListFacebookCommentsRequest extends FormRequest
             ],
 
             /*
-             * Every accepted sort value must have corresponding
-             * ordering logic in the controller.
+             * Every accepted sort value must have
+             * corresponding ordering logic in the controller.
              */
             'sort_by' => [
                 'sometimes',

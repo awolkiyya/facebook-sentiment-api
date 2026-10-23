@@ -26,6 +26,7 @@ use Throwable;
 use App\Services\Facebook\FacebookPostCommentInsightsService;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\DB;
 
 final class FacebookCommentController extends Controller
 {
@@ -56,35 +57,32 @@ final class FacebookCommentController extends Controller
     private const SYNC_RUN_TYPE = 'comments';
 
 
-
-
-    // now overview and timeline
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | List Comments With AI Analysis
-    |--------------------------------------------------------------------------
-    */
-
+   
     /**
-     * List locally synchronized Facebook comments with their latest
-     * persisted AI sentiment analysis.
+     * Return the most frequently identified topics in a Facebook post's
+     * analyzed comments.
      *
-     * This endpoint does not call Meta or perform AI inference.
+     * GET:
+     * /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments/top-topics
      *
-     * Route:
-     * GET /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments
+     * Optional query parameters:
+     * - start_date: YYYY-MM-DD
+     * - end_date: YYYY-MM-DD
+     * - limit: number of topics to return (1–20, default 5)
      *
-     * @throws Throwable
+     * When neither date is provided, all available analyzed comments
+     * are included.
      */
-    public function index(
-        ListFacebookCommentsRequest $request,
-        FacebookCommentQueryService $commentQueryService,
-    ): JsonResponse {
+    public function topTopics(Request $request): JsonResponse
+    {
         $requestId = $this->requestId($request);
-
         $user = $request->user();
+
+        if ($user === null) {
+            return ApiResponse::unauthorized(
+                'Authentication is required.',
+            );
+        }
 
         $facebookPageId = trim(
             (string) $request->route('facebookPageId'),
@@ -94,268 +92,783 @@ final class FacebookCommentController extends Controller
             (string) $request->route('facebookPostId'),
         );
 
-        /*
-        |--------------------------------------------------------------------------
-        | Request Logging
-        |--------------------------------------------------------------------------
-        */
-
-        Log::info('Facebook comments index request started.', [
-            'request_id' => $requestId,
-            'method' => $request->method(),
-            'path' => $request->path(),
-            'user_id' => $user?->id,
-            'facebook_page_id' => $facebookPageId,
-            'facebook_post_id' => $facebookPostId,
-            'ip' => $request->ip(),
+        $validator = Validator::make($request->query(), [
+            'start_date' => [
+                'sometimes',
+                'nullable',
+                'date_format:Y-m-d',
+            ],
+            'end_date' => [
+                'sometimes',
+                'nullable',
+                'date_format:Y-m-d',
+            ],
+            'limit' => [
+                'sometimes',
+                'integer',
+                'min:1',
+                'max:20',
+            ],
         ]);
 
-        /*
-        |--------------------------------------------------------------------------
-        | Authentication
-        |--------------------------------------------------------------------------
-        */
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'The supplied filters are invalid.',
+                'errors' => $validator->errors(),
+                'request_id' => $requestId,
+            ], Response::HTTP_UNPROCESSABLE_ENTITY);
+        }
 
-        if ($user === null) {
-            Log::warning(
-                'Facebook comments index rejected: unauthenticated.',
-                [
-                    'request_id' => $requestId,
-                    'facebook_page_id' => $facebookPageId,
-                    'facebook_post_id' => $facebookPostId,
-                    'ip' => $request->ip(),
+        $filters = $validator->validated();
+
+        $startDate = $filters['start_date'] ?? null;
+        $endDate = $filters['end_date'] ?? null;
+        $limit = (int) ($filters['limit'] ?? 5);
+
+        if ($startDate !== null && $endDate === null) {
+            $endDate = $startDate;
+        } elseif ($endDate !== null && $startDate === null) {
+            $startDate = $endDate;
+        }
+
+        if (
+            $startDate !== null
+            && $endDate !== null
+            && $endDate < $startDate
+        ) {
+            return response()->json([
+                'success' => false,
+                'message' => 'end_date must be on or after start_date.',
+                'errors' => [
+                    'end_date' => [
+                        'The end date must be on or after the start date.',
+                    ],
                 ],
-            );
-
-            return ApiResponse::unauthorized(
-                'Authentication is required.',
-            );
+                'request_id' => $requestId,
+            ], Response::HTTP_UNPROCESSABLE_ENTITY);
         }
 
         try {
-            /*
-            |--------------------------------------------------------------------------
-            | Validated Filters
-            |--------------------------------------------------------------------------
-            */
-
-            $filters = $request->validated();
-
-            $perPage = min(
-                max(
-                    (int) (
-                        $filters['per_page']
-                        ?? self::DEFAULT_PER_PAGE
-                    ),
-                    1,
-                ),
-                self::MAX_PER_PAGE,
-            );
-
-            $pageNumber = max(
-                (int) ($filters['page'] ?? 1),
-                1,
-            );
-
-            $search = trim(
-                (string) ($filters['search'] ?? ''),
-            );
-
-            $sentiment = $filters['sentiment'] ?? null;
-            $language = $filters['language'] ?? null;
-            $analysisStatus = $filters['analysis_status'] ?? null;
-            $sortBy = $filters['sort_by'] ?? 'newest';
-
-            $startDate = $filters['start_date'] ?? null;
-            $endDate = $filters['end_date'] ?? null;
-
-            /*
-            |--------------------------------------------------------------------------
-            | Resolve Authorized Facebook Page
-            |--------------------------------------------------------------------------
-            */
-
-            $facebookPage = $this->resolveUserPage(
+            $page = $this->resolveUserPage(
                 userId: (string) $user->id,
                 facebookPageId: $facebookPageId,
                 requestId: $requestId,
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Resolve Authorized Facebook Post
-            |--------------------------------------------------------------------------
-            |
-            | The post must belong to the authorized page.
-            | facebookPostId is the internal Laravel post identifier.
-            |
-            */
-
-            $facebookPost = $this->resolvePost(
-                page: $facebookPage,
+            $post = $this->resolvePost(
+                page: $page,
                 facebookPostId: $facebookPostId,
                 requestId: $requestId,
             );
 
             /*
-            |--------------------------------------------------------------------------
-            | Query Comments Through Service
-            |--------------------------------------------------------------------------
-            |
-            | The service owns:
-            | - Search and analysis filters
-            | - Date-range filtering
-            | - Sorting
-            | - Pagination
-            |
-            | Authorization remains in the controller.
-            |
+            * Select the latest analysis for each comment.
+            *
+            * DISTINCT ON is PostgreSQL-specific and ensures an older
+            * analysis cannot inflate topic counts.
             */
+            $latestAnalyses = DB::table('sentiment_analyses as sa')
+                ->select([
+                    'sa.facebook_comment_id',
+                    'sa.topic',
+                    'sa.analyzed_at',
+                    'sa.created_at',
+                    'sa.id',
+                ])
+                ->whereNotNull('sa.topic')
+                ->whereRaw("TRIM(sa.topic::text) <> ''")
+                ->distinct()
+                ->orderBy('sa.facebook_comment_id')
+                ->orderByRaw('sa.analyzed_at DESC NULLS LAST')
+                ->orderByDesc('sa.created_at')
+                ->orderByDesc('sa.id');
 
-            $comments = $commentQueryService->paginateForPost(
-                post: $facebookPost,
-                filters: $filters,
-                perPage: $perPage,
-                page: $pageNumber,
+            /*
+            * PostgreSQL DISTINCT ON must be expressed explicitly.
+            * Use a raw subquery to select exactly one latest analysis
+            * for each comment.
+            */
+            $latestAnalyses = DB::query()->fromSub(
+                DB::table('sentiment_analyses as sa')
+                    ->selectRaw(
+                        'DISTINCT ON (sa.facebook_comment_id)
+                            sa.facebook_comment_id,
+                            sa.topic,
+                            sa.analyzed_at,
+                            sa.created_at,
+                            sa.id',
+                    )
+                    ->whereNotNull('sa.topic')
+                    ->whereRaw("TRIM(sa.topic::text) <> ''")
+                    ->orderBy('sa.facebook_comment_id')
+                    ->orderByRaw('sa.analyzed_at DESC NULLS LAST')
+                    ->orderByDesc('sa.created_at')
+                    ->orderByDesc('sa.id'),
+                'latest_analysis',
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Count Analyzed Comments On Current Page
-            |--------------------------------------------------------------------------
-            */
-
-            $analyzedCount = collect($comments->items())
-                ->filter(
-                    static fn (FacebookComment $comment): bool =>
-                        $comment->latestSentimentAnalysis !== null,
+            $query = DB::table('facebook_comments as fc')
+                ->joinSub(
+                    $latestAnalyses,
+                    'latest_analysis',
+                    'latest_analysis.facebook_comment_id',
+                    '=',
+                    'fc.id',
                 )
-                ->count();
+                ->where('fc.facebook_post_id', $post->getKey())
+                ->whereNull('fc.parent_comment_id');
 
-            /*
-            |--------------------------------------------------------------------------
-            | Serialize Resources
-            |--------------------------------------------------------------------------
-            */
+            if ($startDate !== null && $endDate !== null) {
+                $query
+                    ->where(
+                        'fc.commented_at',
+                        '>=',
+                        CarbonImmutable::parse($startDate)->startOfDay(),
+                    )
+                    ->where(
+                        'fc.commented_at',
+                        '<',
+                        CarbonImmutable::parse($endDate)
+                            ->startOfDay()
+                            ->addDay(),
+                    );
+            }
 
-            $commentData = collect($comments->items())
-                ->map(
-                    fn (FacebookComment $comment): array =>
-                        FacebookCommentResource::make($comment)
-                            ->resolve($request),
+            $totalTopicComments = (clone $query)->count();
+
+            $topics = $query
+                ->selectRaw(
+                    'TRIM(latest_analysis.topic::text) AS topic',
                 )
-                ->values()
-                ->all();
+                ->selectRaw('COUNT(*) AS comment_count')
+                ->groupByRaw('TRIM(latest_analysis.topic::text)')
+                ->orderByDesc('comment_count')
+                ->orderBy('topic')
+                ->limit($limit)
+                ->get();
 
-            /*
-            |--------------------------------------------------------------------------
-            | Pagination Metadata
-            |--------------------------------------------------------------------------
-            */
+            $data = $topics->map(
+                static function (object $topic) use ($totalTopicComments): array {
+                    $count = (int) $topic->comment_count;
 
-            $pagination = [
-                'current_page' => $comments->currentPage(),
-                'per_page' => $comments->perPage(),
-                'total' => $comments->total(),
-                'last_page' => $comments->lastPage(),
-                'from' => $comments->firstItem(),
-                'to' => $comments->lastItem(),
-                'has_more' => $comments->hasMorePages(),
-            ];
-
-            /*
-            |--------------------------------------------------------------------------
-            | Success Logging
-            |--------------------------------------------------------------------------
-            */
+                    return [
+                        'topic' => (string) $topic->topic,
+                        'comment_count' => $count,
+                        'percentage' => $totalTopicComments > 0
+                            ? round(
+                                ($count / $totalTopicComments) * 100,
+                                2,
+                            )
+                            : 0.0,
+                    ];
+                },
+            )->values()->all();
 
             Log::info(
-                'Facebook comments with AI analysis loaded successfully.',
+                'Facebook post top topics retrieved.',
                 [
                     'request_id' => $requestId,
                     'user_id' => $user->id,
+                    'facebook_page_internal_id' => $page->id,
+                    'facebook_post_internal_id' => $post->id,
+                    'start_date' => $startDate,
+                    'end_date' => $endDate,
+                    'limit' => $limit,
+                    'topic_count' => count($data),
+                    'analyzed_comment_count' => $totalTopicComments,
+                ],
+            );
 
-                    'facebook_page_internal_id' => $facebookPage->id,
-                    'facebook_page_id' => $facebookPage->facebook_page_id,
-
-                    'facebook_post_internal_id' => $facebookPost->id,
-                    'facebook_post_id' => $facebookPost->facebook_post_id,
-
-                    'filters' => [
-                        'search_applied' => $search !== '',
-                        'sentiment' => $sentiment,
-                        'language' => $language,
-                        'analysis_status' => $analysisStatus,
-                        'sort_by' => $sortBy,
+            return ApiResponse::success(
+                data: [
+                    'topics' => $data,
+                    'analyzed_comment_count' => $totalTopicComments,
+                ],
+                message: 'Facebook post top topics retrieved successfully.',
+                meta: [
+                    'post_id' => $post->id,
+                    'period' => [
+                        'type' => $startDate === null
+                            ? 'all_time'
+                            : 'custom',
                         'start_date' => $startDate,
                         'end_date' => $endDate,
                     ],
-
-                    'current_page' => $comments->currentPage(),
-                    'per_page' => $comments->perPage(),
-                    'total_comments' => $comments->total(),
-                    'returned_count' => $comments->count(),
-                    'analyzed_count' => $analyzedCount,
-                    'unanalyzed_count' => max(
-                        $comments->count() - $analyzedCount,
-                        0,
+                    'limit' => $limit,
+                ],
+            );
+        } catch (RuntimeException $exception) {
+            Log::warning(
+                'Facebook post top topics resource resolution failed.',
+                [
+                    'request_id' => $requestId,
+                    'user_id' => $user->id,
+                    'facebook_page_id' => $facebookPageId,
+                    'facebook_post_id' => $facebookPostId,
+                    'exception_class' => $exception::class,
+                    'exception_message' => $this->safeExceptionMessage(
+                        $exception,
                     ),
                 ],
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Success Response
-            |--------------------------------------------------------------------------
-            */
-
-            return ApiResponse::success(
-                data: $commentData,
-                message: 'Facebook comments retrieved successfully.',
-                meta: [
-                    'pagination' => $pagination,
-                ],
-            );
-        } catch (RuntimeException $exception) {
-            Log::error(
-                'Facebook comments index request failed.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user->id,
-                    'facebook_page_id' => $facebookPageId,
-                    'facebook_post_id' => $facebookPostId,
-                    'exception_class' => $exception::class,
-                    'exception_message' =>
-                        $this->safeExceptionMessage($exception),
-                ],
-            );
-
-            report($exception);
-
-            return ApiResponse::serverError(
-                'Failed to retrieve Facebook comments.',
-            );
+            return response()->json([
+                'success' => false,
+                'message' => $exception->getMessage(),
+                'request_id' => $requestId,
+            ], Response::HTTP_NOT_FOUND);
         } catch (Throwable $exception) {
-            Log::critical(
-                'Unexpected failure retrieving Facebook comments.',
+            Log::error(
+                'Facebook post top topics request failed.',
                 [
                     'request_id' => $requestId,
                     'user_id' => $user->id,
                     'facebook_page_id' => $facebookPageId,
                     'facebook_post_id' => $facebookPostId,
                     'exception_class' => $exception::class,
-                    'exception_message' =>
-                        $this->safeExceptionMessage($exception),
+                    'exception_message' => $this->safeExceptionMessage(
+                        $exception,
+                    ),
                 ],
             );
 
             report($exception);
 
             return ApiResponse::serverError(
-                'Failed to retrieve Facebook comments.',
+                'Failed to retrieve Facebook post top topics.',
             );
         }
     }
+
+
+
+
+   /**
+ * Return overall sentiment, sentiment distribution, and daily sentiment
+ * timeline for a Facebook post.
+ *
+ * GET:
+ * /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments/sentiment-overview
+ *
+ * Optional query parameters:
+ * - start_date: YYYY-MM-DD
+ * - end_date: YYYY-MM-DD
+ *
+ * If both dates are omitted, all available analyzed comments are included.
+ * If only one date is supplied, that date is used for both boundaries.
+ */
+public function sentimentOverview(
+    Request $request,
+    FacebookPostCommentInsightsService $insightsService,
+): JsonResponse {
+    $requestId = $this->requestId($request);
+    $user = $request->user();
+
+    if ($user === null) {
+        return ApiResponse::unauthorized(
+            'Authentication is required.',
+        );
+    }
+
+    $facebookPageId = trim(
+        (string) $request->route('facebookPageId'),
+    );
+
+    $facebookPostId = trim(
+        (string) $request->route('facebookPostId'),
+    );
+
+    $validator = Validator::make($request->query(), [
+        'start_date' => [
+            'sometimes',
+            'nullable',
+            'date_format:Y-m-d',
+        ],
+        'end_date' => [
+            'sometimes',
+            'nullable',
+            'date_format:Y-m-d',
+        ],
+    ]);
+
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'The supplied date filters are invalid.',
+            'errors' => $validator->errors(),
+            'request_id' => $requestId,
+        ], Response::HTTP_UNPROCESSABLE_ENTITY);
+    }
+
+    $filters = $validator->validated();
+
+    try {
+        /*
+         * Resolve the authorized Facebook page and post first.
+         */
+        $page = $this->resolveUserPage(
+            userId: (string) $user->id,
+            facebookPageId: $facebookPageId,
+            requestId: $requestId,
+        );
+
+        $post = $this->resolvePost(
+            page: $page,
+            facebookPostId: $facebookPostId,
+            requestId: $requestId,
+        );
+
+        /*
+         * All-time behavior:
+         *
+         * When neither date is supplied, keep both boundaries null.
+         * The insights service must interpret null boundaries as
+         * unbounded and include all available analyzed comments.
+         *
+         * When either date is supplied, use the supplied date for any
+         * missing boundary, making a single date a one-day period.
+         */
+        $startDate = $filters['start_date'] ?? null;
+        $endDate = $filters['end_date'] ?? null;
+
+        $startAt = null;
+        $endExclusive = null;
+
+        if ($startDate !== null || $endDate !== null) {
+            if ($startDate === null) {
+                $startDate = $endDate;
+            }
+
+            if ($endDate === null) {
+                $endDate = $startDate;
+            }
+
+            /*
+             * Both dates are guaranteed to be non-null here.
+             */
+            if ($endDate < $startDate) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'end_date must be on or after start_date.',
+                    'errors' => [
+                        'end_date' => [
+                            'The end date must be on or after the start date.',
+                        ],
+                    ],
+                    'request_id' => $requestId,
+                ], Response::HTTP_UNPROCESSABLE_ENTITY);
+            }
+
+            /*
+             * Use an inclusive start and exclusive end boundary.
+             * This includes every timestamp on the selected end date.
+             */
+            $startAt = CarbonImmutable::parse($startDate)
+                ->startOfDay();
+
+            $endExclusive = CarbonImmutable::parse($endDate)
+                ->startOfDay()
+                ->addDay();
+        }
+
+        /*
+         * The insights service must accept nullable boundaries and
+         * omit date constraints when the corresponding boundary is null.
+         */
+        $overview = $insightsService->sentimentOverview(
+            post: $post,
+            startAt: $startAt,
+            endExclusive: $endExclusive,
+        );
+
+        Log::info(
+            'Facebook post sentiment overview retrieved.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_internal_id' => $page->id,
+                'facebook_post_internal_id' => $post->id,
+                'period_type' => (
+                    $startDate === null && $endDate === null
+                ) ? 'all_time' : 'custom',
+                'start_date' => $startDate,
+                'end_date' => $endDate,
+                'analyzed_count' => $overview[
+                    'overall_sentiment'
+                ]['analyzed_count'],
+                'timeline_days' => count(
+                    $overview['sentiment_timeline']['data'],
+                ),
+            ],
+        );
+
+        return ApiResponse::success(
+            data: $overview,
+            message: 'Facebook post sentiment overview retrieved successfully.',
+            meta: [
+                'post_id' => $post->id,
+                'period' => [
+                    'type' => (
+                        $startDate === null && $endDate === null
+                    ) ? 'all_time' : 'custom',
+                    'start_date' => $startDate,
+                    'end_date' => $endDate,
+                ],
+            ],
+        );
+    } catch (RuntimeException $exception) {
+        Log::warning(
+            'Facebook post sentiment overview resource resolution failed.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'exception_class' => $exception::class,
+                'exception_message' => $this->safeExceptionMessage(
+                    $exception,
+                ),
+            ],
+        );
+
+        return response()->json([
+            'success' => false,
+            'message' => $exception->getMessage(),
+            'request_id' => $requestId,
+        ], Response::HTTP_NOT_FOUND);
+    } catch (Throwable $exception) {
+        Log::error(
+            'Facebook post sentiment overview request failed.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'exception_class' => $exception::class,
+                'exception_message' => $this->safeExceptionMessage(
+                    $exception,
+                ),
+            ],
+        );
+
+        report($exception);
+
+        return ApiResponse::serverError(
+            'Failed to retrieve Facebook post sentiment overview.',
+        );
+    }
+}
+
+   
+/*
+|--------------------------------------------------------------------------
+| List Comments With AI Analysis
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * List locally synchronized Facebook comments with their latest
+ * persisted AI sentiment analysis.
+ *
+ * This endpoint does not call Meta or perform AI inference.
+ *
+ * Route:
+ * GET /api/v1/facebook/pages/{facebookPageId}/posts/{facebookPostId}/comments
+ *
+ * Filtering, sorting, and pagination are delegated to
+ * FacebookCommentQueryService.
+ *
+ * @throws Throwable
+ */
+public function index(
+    ListFacebookCommentsRequest $request,
+    FacebookCommentQueryService $commentQueryService,
+): JsonResponse {
+    $requestId = $this->requestId($request);
+
+    $user = $request->user();
+
+    $facebookPageId = trim(
+        (string) $request->route('facebookPageId'),
+    );
+
+    $facebookPostId = trim(
+        (string) $request->route('facebookPostId'),
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Request Logging
+    |--------------------------------------------------------------------------
+    */
+
+    Log::info('Facebook comments index request started.', [
+        'request_id' => $requestId,
+        'method' => $request->method(),
+        'path' => $request->path(),
+        'user_id' => $user?->id,
+        'facebook_page_id' => $facebookPageId,
+        'facebook_post_id' => $facebookPostId,
+        'ip' => $request->ip(),
+    ]);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Authentication
+    |--------------------------------------------------------------------------
+    */
+
+    if ($user === null) {
+        Log::warning(
+            'Facebook comments index rejected: unauthenticated.',
+            [
+                'request_id' => $requestId,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'ip' => $request->ip(),
+            ],
+        );
+
+        return ApiResponse::unauthorized(
+            'Authentication is required.',
+        );
+    }
+
+    try {
+        /*
+        |--------------------------------------------------------------------------
+        | Validated Filters
+        |--------------------------------------------------------------------------
+        */
+
+        $filters = $request->validated();
+
+        $perPage = min(
+            max(
+                (int) (
+                    $filters['per_page']
+                    ?? self::DEFAULT_PER_PAGE
+                ),
+                1,
+            ),
+            self::MAX_PER_PAGE,
+        );
+
+        $pageNumber = max(
+            (int) ($filters['page'] ?? 1),
+            1,
+        );
+
+        $search = trim(
+            (string) ($filters['search'] ?? ''),
+        );
+
+        $sentiment = $filters['sentiment'] ?? null;
+        $language = $filters['language'] ?? null;
+        $analysisStatus = $filters['analysis_status'] ?? null;
+        $commenter = $filters['commenter'] ?? null;
+        $sortBy = $filters['sort_by'] ?? 'newest';
+
+        $startDate = $filters['start_date'] ?? null;
+        $endDate = $filters['end_date'] ?? null;
+
+        /*
+        |--------------------------------------------------------------------------
+        | Resolve Authorized Facebook Page
+        |--------------------------------------------------------------------------
+        */
+
+        $facebookPage = $this->resolveUserPage(
+            userId: (string) $user->id,
+            facebookPageId: $facebookPageId,
+            requestId: $requestId,
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Resolve Authorized Facebook Post
+        |--------------------------------------------------------------------------
+        |
+        | The post must belong to the authorized page.
+        | facebookPostId is the internal Laravel post identifier.
+        |
+        */
+
+        $facebookPost = $this->resolvePost(
+            page: $facebookPage,
+            facebookPostId: $facebookPostId,
+            requestId: $requestId,
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Query Comments Through Service
+        |--------------------------------------------------------------------------
+        |
+        | The query service owns:
+        | - Search filtering
+        | - Sentiment and language filtering
+        | - Analysis-status filtering
+        | - Commenter filtering
+        | - Date-range filtering
+        | - Sorting
+        | - Pagination
+        |
+        | Filters must be applied before pagination so that the returned
+        | records and pagination totals remain consistent.
+        |
+        | Authorization remains in the controller.
+        |
+        */
+
+        $comments = $commentQueryService->paginateForPost(
+            post: $facebookPost,
+            filters: $filters,
+            perPage: $perPage,
+            page: $pageNumber,
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Count Analyzed Comments On Current Page
+        |--------------------------------------------------------------------------
+        */
+
+        $analyzedCount = collect($comments->items())
+            ->filter(
+                static fn (FacebookComment $comment): bool =>
+                    $comment->latestSentimentAnalysis !== null,
+            )
+            ->count();
+
+        $returnedCount = $comments->count();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Serialize Resources
+        |--------------------------------------------------------------------------
+        */
+
+        $commentData = collect($comments->items())
+            ->map(
+                fn (FacebookComment $comment): array =>
+                    FacebookCommentResource::make($comment)
+                        ->resolve($request),
+            )
+            ->values()
+            ->all();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Pagination Metadata
+        |--------------------------------------------------------------------------
+        */
+
+        $pagination = [
+            'current_page' => $comments->currentPage(),
+            'per_page' => $comments->perPage(),
+            'total' => $comments->total(),
+            'last_page' => $comments->lastPage(),
+            'from' => $comments->firstItem(),
+            'to' => $comments->lastItem(),
+            'has_more' => $comments->hasMorePages(),
+        ];
+
+        /*
+        |--------------------------------------------------------------------------
+        | Success Logging
+        |--------------------------------------------------------------------------
+        */
+
+        Log::info(
+            'Facebook comments with AI analysis loaded successfully.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+
+                'facebook_page_internal_id' => $facebookPage->id,
+                'facebook_page_id' => $facebookPage->facebook_page_id,
+
+                'facebook_post_internal_id' => $facebookPost->id,
+                'facebook_post_id' => $facebookPost->facebook_post_id,
+
+                'filters' => [
+                    'search_applied' => $search !== '',
+                    'sentiment' => $sentiment,
+                    'language' => $language,
+                    'analysis_status' => $analysisStatus,
+                    'commenter' => $commenter,
+                    'sort_by' => $sortBy,
+                    'start_date' => $startDate,
+                    'end_date' => $endDate,
+                ],
+
+                'current_page' => $comments->currentPage(),
+                'per_page' => $comments->perPage(),
+                'total_comments' => $comments->total(),
+                'returned_count' => $returnedCount,
+                'analyzed_count' => $analyzedCount,
+                'unanalyzed_count' => max(
+                    $returnedCount - $analyzedCount,
+                    0,
+                ),
+            ],
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Success Response
+        |--------------------------------------------------------------------------
+        */
+
+        return ApiResponse::success(
+            data: $commentData,
+            message: 'Facebook comments retrieved successfully.',
+            meta: [
+                'pagination' => $pagination,
+            ],
+        );
+    } catch (RuntimeException $exception) {
+        Log::error(
+            'Facebook comments index request failed.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'exception_class' => $exception::class,
+                'exception_message' =>
+                    $this->safeExceptionMessage($exception),
+            ],
+        );
+
+        report($exception);
+
+        return ApiResponse::serverError(
+            'Failed to retrieve Facebook comments.',
+        );
+    } catch (Throwable $exception) {
+        Log::critical(
+            'Unexpected failure retrieving Facebook comments.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user->id,
+                'facebook_page_id' => $facebookPageId,
+                'facebook_post_id' => $facebookPostId,
+                'exception_class' => $exception::class,
+                'exception_message' =>
+                    $this->safeExceptionMessage($exception),
+            ],
+        );
+
+        report($exception);
+
+        return ApiResponse::serverError(
+            'Failed to retrieve Facebook comments.',
+        );
+    }
+}
 
 
 

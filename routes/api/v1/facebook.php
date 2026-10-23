@@ -276,5 +276,18 @@ Route::prefix('facebook')->group(function (): void {
                 [FacebookCommentController::class, 'insights']
             )->whereUuid('facebookPostId')
                 ->name('facebook.pages.posts.comments.insights');
+
+
+
+            Route::get(
+                    '/{facebookPageId}/posts/{facebookPostId}/comments/sentiment-overview',
+                    [FacebookCommentController::class, 'sentimentOverview'],
+            )->name('facebook.posts.comments.sentiment-overview');
+
+
+            Route::get(
+                '/{facebookPageId}/posts/{facebookPostId}/comments/top-topics',
+                [FacebookCommentController::class, 'topTopics'],
+            )->name('facebook.posts.comments.top-topics');
         });
 });
