@@ -911,14 +911,25 @@ class MfaService
     */
 
     /**
-     * Check whether TOTP MFA is enabled.
+     * Check whether MFA verification is required because TOTP
+     * is enabled on the account or a confirmed TOTP method exists.
      *
-     * This uses the account-level users.mfa_enabled flag.
+     * The account-level flag is retained as a fail-closed safeguard:
+     * a stale enabled flag must not silently bypass MFA.
      */
-    public function hasEnabledTotp(
-        User $user
-    ): bool {
-        return (bool) $user->mfa_enabled;
+    public function hasEnabledTotp(User $user): bool
+    {
+        if ((bool) $user->mfa_enabled) {
+            return true;
+        }
+
+        return UserMfaMethod::query()
+            ->where('user_id', $user->getKey())
+            ->where('type', self::TOTP_TYPE)
+            ->where('is_active', true)
+            ->whereNotNull('confirmed_at')
+            ->whereNotNull('secret')
+            ->exists();
     }
 
 
