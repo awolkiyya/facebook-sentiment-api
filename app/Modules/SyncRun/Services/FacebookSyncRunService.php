@@ -23,22 +23,16 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Statistics that can be updated by a synchronization process.
-     */
     private const STATISTIC_FIELDS = [
         'posts_fetched',
         'posts_created',
         'posts_updated',
-
         'comments_fetched',
         'comments_created',
         'comments_updated',
         'comments_failed',
-
         'posts_queued_for_ai',
         'comments_queued_for_ai',
-
         'ai_completed',
         'ai_failed',
     ];
@@ -49,29 +43,21 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Pipeline counters stored inside metadata.
-     *
-     * These counters describe asynchronous downstream work.
-     */
     private const PIPELINE_COUNTERS = [
         'comment_jobs_expected',
         'comment_jobs_completed',
         'comment_jobs_failed',
-
         'post_ai_jobs_expected',
         'post_ai_jobs_completed',
         'post_ai_jobs_failed',
-
         'comment_ai_jobs_expected',
         'comment_ai_jobs_completed',
         'comment_ai_jobs_failed',
     ];
 
-    /**
-     * Maximum number of operation keys retained in SyncRun metadata.
-     */
     private const MAX_PIPELINE_OPERATION_KEYS = 5000;
+
+    private const MAX_RETRY_HISTORY = 100;
 
     /*
     |--------------------------------------------------------------------------
@@ -80,9 +66,13 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Create a new synchronization run.
+     * Create a synchronization run.
      *
-     * Only one queued/running synchronization is allowed per Facebook Page.
+     * The Facebook Page row lock serializes run creation and retry
+     * operations for the same page, provided all creation paths use
+     * this service and follow the same locking order.
+     *
+     * @param array<string, mixed> $metadata
      */
     public function create(
         string $facebookPageId,
@@ -92,6 +82,16 @@ final class FacebookSyncRunService
         string $queue = 'facebook',
         array $metadata = [],
     ): FacebookSyncRun {
+        $queue = trim($queue);
+
+        if ($queue === '') {
+            throw ValidationException::withMessages([
+                'queue' => [
+                    'The queue name cannot be empty.',
+                ],
+            ]);
+        }
+
         return DB::transaction(function () use (
             $facebookPageId,
             $type,
@@ -114,10 +114,6 @@ final class FacebookSyncRunService
                     );
             }
 
-            /*
-             * A disconnected/deactivated page cannot start
-             * a new synchronization.
-             */
             if (! $page->is_active) {
                 throw ValidationException::withMessages([
                     'facebook_page_id' => [
@@ -126,14 +122,8 @@ final class FacebookSyncRunService
                 ]);
             }
 
-            /*
-             * Prevent concurrent synchronization for the same page.
-             */
             $activeRunExists = FacebookSyncRun::query()
-                ->where(
-                    'facebook_page_id',
-                    $facebookPageId,
-                )
+                ->where('facebook_page_id', $facebookPageId)
                 ->whereIn('status', [
                     FacebookSyncStatus::QUEUED->value,
                     FacebookSyncStatus::RUNNING->value,
@@ -149,34 +139,20 @@ final class FacebookSyncRunService
             }
 
             return FacebookSyncRun::query()->create([
-                'facebook_page_id' =>
-                    $facebookPageId,
-
-                'triggered_by_user_id' =>
-                    $triggeredByUserId,
-
-                'trigger' =>
-                    $trigger,
-
-                'type' =>
-                    $type,
-
-                'status' =>
-                    FacebookSyncStatus::QUEUED,
-
-                'queue' =>
-                    $queue,
-
-                'attempts' =>
-                    0,
-
-                'queued_at' =>
-                    now(),
-
-                'metadata' =>
-                    $metadata !== []
-                        ? $metadata
-                        : null,
+                'facebook_page_id' => $facebookPageId,
+                'triggered_by_user_id' => $triggeredByUserId,
+                'trigger' => $trigger,
+                'type' => $type,
+                'status' => FacebookSyncStatus::QUEUED,
+                'queue' => $queue,
+                'attempts' => 0,
+                'queued_at' => now(),
+                'started_at' => null,
+                'last_heartbeat_at' => null,
+                'completed_at' => null,
+                'finished_at' => null,
+                'error_message' => null,
+                'metadata' => $metadata !== [] ? $metadata : null,
             ]);
         }, attempts: 3);
     }
@@ -188,7 +164,11 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Mark a queued synchronization run as running.
+     * Mark a queued run as running.
+     *
+     * A queue redelivery may encounter a run that is already running.
+     * Such a redelivery refreshes the heartbeat but does not increment
+     * the run attempt count again.
      */
     public function markRunning(
         string $runId,
@@ -203,30 +183,21 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            /*
-             * A retry of the same root queue job may encounter
-             * a RUNNING SyncRun.
-             *
-             * Do not move it backwards or fail merely because
-             * the worker is retrying.
-             */
-            if (
-                $run->status === FacebookSyncStatus::RUNNING
-            ) {
-                if (
-                    $jobId !== null
-                    && $run->job_id === null
-                ) {
+            $now = now();
+
+            if ($run->status === FacebookSyncStatus::RUNNING) {
+                $run->last_heartbeat_at = $now;
+
+                if ($jobId !== null && $run->job_id === null) {
                     $run->job_id = $jobId;
-                    $run->save();
                 }
+
+                $run->save();
 
                 return $run->refresh();
             }
 
-            if (
-                $run->status !== FacebookSyncStatus::QUEUED
-            ) {
+            if ($run->status !== FacebookSyncStatus::QUEUED) {
                 throw ValidationException::withMessages([
                     'status' => [
                         "Cannot start a sync run with status '{$run->status->value}'.",
@@ -234,21 +205,51 @@ final class FacebookSyncRunService
                 ]);
             }
 
-            $run->status =
-                FacebookSyncStatus::RUNNING;
+            $run->status = FacebookSyncStatus::RUNNING;
+            $run->started_at = $run->started_at ?? $now;
+            $run->last_heartbeat_at = $now;
+            $run->finished_at = null;
+            $run->completed_at = null;
+            $run->job_id = $jobId;
+            $run->attempts = ((int) $run->attempts) + 1;
+            $run->error_message = null;
 
-            $run->started_at =
-                now();
+            $run->save();
 
-            $run->job_id =
-                $jobId;
+            return $run->refresh();
+        }, attempts: 3);
+    }
 
-            $run->attempts =
-                ((int) $run->attempts) + 1;
+    /*
+    |--------------------------------------------------------------------------
+    | Heartbeat
+    |--------------------------------------------------------------------------
+    */
 
-            $run->error_message =
-                null;
+    /**
+     * Record activity for a running synchronization.
+     *
+     * Workers should call this periodically during long-running work.
+     */
+    public function heartbeat(string $runId): FacebookSyncRun
+    {
+        return DB::transaction(function () use (
+            $runId,
+        ): FacebookSyncRun {
+            /** @var FacebookSyncRun $run */
+            $run = FacebookSyncRun::query()
+                ->lockForUpdate()
+                ->findOrFail($runId);
 
+            if ($run->status !== FacebookSyncStatus::RUNNING) {
+                throw ValidationException::withMessages([
+                    'status' => [
+                        "Cannot record a heartbeat for a sync run with status '{$run->status->value}'.",
+                    ],
+                ]);
+            }
+
+            $run->last_heartbeat_at = now();
             $run->save();
 
             return $run->refresh();
@@ -262,10 +263,10 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Cancel a queued or running synchronization run.
+     * Cancel a queued or running synchronization.
      *
-     * The queue worker must also respect the CANCELLED status before
-     * performing additional pipeline work.
+     * The queue worker must check the run status before starting
+     * additional work. This method does not itself terminate a worker.
      */
     public function cancel(
         FacebookSyncRun $run,
@@ -273,19 +274,14 @@ final class FacebookSyncRunService
     ): FacebookSyncRun {
         return DB::transaction(function () use (
             $run,
+            $user,
         ): FacebookSyncRun {
             /** @var FacebookSyncRun $lockedRun */
             $lockedRun = FacebookSyncRun::query()
                 ->lockForUpdate()
                 ->findOrFail($run->getKey());
 
-            /*
-             * A completed, failed, or already cancelled run
-             * cannot be cancelled again.
-             */
-            if (
-                ! $lockedRun->status->canCancel()
-            ) {
+            if (! $lockedRun->status->canCancel()) {
                 throw ValidationException::withMessages([
                     'status' => [
                         "Cannot cancel a sync run with status '{$lockedRun->status->value}'.",
@@ -293,31 +289,29 @@ final class FacebookSyncRunService
                 ]);
             }
 
+            $now = now();
+
             $metadata = is_array($lockedRun->metadata)
                 ? $lockedRun->metadata
                 : [];
 
-            /*
-             * Record cancellation information without destroying
-             * the existing synchronization metadata.
-             */
             $metadata['cancellation'] = [
-                'cancelled_at' =>
-                    now()->toIso8601String(),
-
-                'previous_status' =>
-                    $lockedRun->status->value,
+                'cancelled_at' => $now->toIso8601String(),
+                'previous_status' => $lockedRun->status->value,
             ];
 
-            $lockedRun->metadata =
-                $metadata;
+            if ($user !== null && isset($user->id)) {
+                $metadata['cancellation']['cancelled_by_user_id'] =
+                    (string) $user->id;
+            }
 
-            $lockedRun->status =
-                FacebookSyncStatus::CANCELLED;
+            $lockedRun->metadata = $metadata;
+            $lockedRun->status = FacebookSyncStatus::CANCELLED;
 
-            $lockedRun->completed_at =
-                now();
-
+            // Cancellation is terminal, but not successful completion.
+            $lockedRun->completed_at = null;
+            $lockedRun->finished_at = $now;
+            $lockedRun->last_heartbeat_at = $now;
             $lockedRun->error_message =
                 'Synchronization was cancelled by the user.';
 
@@ -334,17 +328,11 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Prepare a failed/cancelled synchronization run for retry.
+     * Prepare a failed or cancelled run for retry.
      *
-     * IMPORTANT:
-     * This method intentionally does not dispatch a queue job.
-     *
-     * The caller/job orchestration layer must dispatch the correct
-     * root job according to the run type.
-     *
-     * This prevents this service from making assumptions about
-     * SyncFacebookCommentsJob or the post synchronization job
-     * constructor.
+     * This method does not dispatch a queue job. The orchestration
+     * layer must dispatch the correct root job after this transaction
+     * succeeds.
      */
     public function retry(
         FacebookSyncRun $run,
@@ -352,56 +340,22 @@ final class FacebookSyncRunService
     ): FacebookSyncRun {
         return DB::transaction(function () use (
             $run,
+            $user,
         ): FacebookSyncRun {
-            /** @var FacebookSyncRun $lockedRun */
-            $lockedRun = FacebookSyncRun::query()
-                ->lockForUpdate()
+            /*
+             * Establish a consistent lock order:
+             * Facebook Page first, then SyncRun.
+             *
+             * This reduces deadlock risk with create(), which also
+             * locks the Facebook Page before checking active runs.
+             */
+            /** @var FacebookSyncRun $initialRun */
+            $initialRun = FacebookSyncRun::query()
                 ->findOrFail($run->getKey());
 
-            /*
-             * Only FAILED and CANCELLED runs may be retried.
-             */
-            if (
-                ! $lockedRun->status->canRetry()
-            ) {
-                throw ValidationException::withMessages([
-                    'status' => [
-                        "Cannot retry a sync run with status '{$lockedRun->status->value}'.",
-                    ],
-                ]);
-            }
-
-            /*
-             * Check again while holding the row lock to prevent
-             * accidentally creating a second active run for the
-             * same Facebook Page.
-             */
-            $activeRunExists = FacebookSyncRun::query()
-                ->where(
-                    'facebook_page_id',
-                    $lockedRun->facebook_page_id,
-                )
-                ->whereIn('status', [
-                    FacebookSyncStatus::QUEUED->value,
-                    FacebookSyncStatus::RUNNING->value,
-                ])
-                ->whereKey('!=', $lockedRun->getKey())
-                ->exists();
-
-            if ($activeRunExists) {
-                throw ValidationException::withMessages([
-                    'facebook_page_id' => [
-                        'Another synchronization run is already queued or running for this Facebook Page.',
-                    ],
-                ]);
-            }
-
-            /*
-             * The Facebook Page must still be active.
-             */
             /** @var FacebookPage|null $page */
             $page = FacebookPage::query()
-                ->whereKey($lockedRun->facebook_page_id)
+                ->whereKey($initialRun->facebook_page_id)
                 ->lockForUpdate()
                 ->first();
 
@@ -409,8 +363,29 @@ final class FacebookSyncRunService
                 throw (new ModelNotFoundException())
                     ->setModel(
                         FacebookPage::class,
-                        [$lockedRun->facebook_page_id],
+                        [$initialRun->facebook_page_id],
                     );
+            }
+
+            /** @var FacebookSyncRun $lockedRun */
+            $lockedRun = FacebookSyncRun::query()
+                ->lockForUpdate()
+                ->findOrFail($run->getKey());
+
+            if ($lockedRun->facebook_page_id !== $page->getKey()) {
+                throw ValidationException::withMessages([
+                    'facebook_page_id' => [
+                        'The Facebook Page associated with this run has changed. Reload and try again.',
+                    ],
+                ]);
+            }
+
+            if (! $lockedRun->status->canRetry()) {
+                throw ValidationException::withMessages([
+                    'status' => [
+                        "Cannot retry a sync run with status '{$lockedRun->status->value}'.",
+                    ],
+                ]);
             }
 
             if (! $page->is_active) {
@@ -421,100 +396,78 @@ final class FacebookSyncRunService
                 ]);
             }
 
+            $activeRunExists = FacebookSyncRun::query()
+                ->where('facebook_page_id', $lockedRun->facebook_page_id)
+                ->whereIn('status', [
+                    FacebookSyncStatus::QUEUED->value,
+                    FacebookSyncStatus::RUNNING->value,
+                ])
+                ->where(
+                    $lockedRun->getKeyName(),
+                    '<>',
+                    $lockedRun->getKey(),
+                )
+                ->exists();
+
+            if ($activeRunExists) {
+                throw ValidationException::withMessages([
+                    'facebook_page_id' => [
+                        'Another synchronization run is already queued or running for this Facebook Page.',
+                    ],
+                ]);
+            }
+
+            $now = now();
+
             $metadata = is_array($lockedRun->metadata)
                 ? $lockedRun->metadata
                 : [];
 
-            /*
-             * Preserve the previous attempt information for
-             * auditing/debugging.
-             */
-            $retryHistory = is_array(
-                $metadata['retry_history'] ?? null,
-            )
+            $retryHistory = is_array($metadata['retry_history'] ?? null)
                 ? $metadata['retry_history']
                 : [];
 
-            $retryHistory[] = [
-                'retried_at' =>
-                    now()->toIso8601String(),
-
-                'previous_status' =>
-                    $lockedRun->status->value,
-
-                'previous_job_id' =>
-                    $lockedRun->job_id,
-
-                'previous_attempts' =>
-                    (int) $lockedRun->attempts,
+            $retryRecord = [
+                'retried_at' => $now->toIso8601String(),
+                'previous_status' => $lockedRun->status->value,
+                'previous_job_id' => $lockedRun->job_id,
+                'previous_attempts' => (int) $lockedRun->attempts,
             ];
 
-            /*
-             * Avoid unlimited metadata growth.
-             */
-            if (count($retryHistory) > 100) {
+            if ($user !== null && isset($user->id)) {
+                $retryRecord['retried_by_user_id'] = (string) $user->id;
+            }
+
+            $retryHistory[] = $retryRecord;
+
+            if (count($retryHistory) > self::MAX_RETRY_HISTORY) {
                 $retryHistory = array_slice(
                     $retryHistory,
-                    -100,
+                    -self::MAX_RETRY_HISTORY,
                 );
             }
 
-            $metadata['retry_history'] =
-                $retryHistory;
+            $metadata['retry_history'] = $retryHistory;
+            $metadata['retry_count'] = count($retryHistory);
 
-            $metadata['retry_count'] =
-                count($retryHistory);
+            // Downstream pipeline state must be rebuilt for the new attempt.
+            unset($metadata['pipeline'], $metadata['cancellation']);
 
-            /*
-             * The existing pipeline must be rebuilt for the
-             * new attempt.
-             *
-             * Keeping the old pipeline counters would cause
-             * the new attempt to inherit completed/failed jobs
-             * from the previous attempt.
-             */
-            unset($metadata['pipeline']);
+            $lockedRun->metadata = $metadata;
+            $lockedRun->status = FacebookSyncStatus::QUEUED;
+            $lockedRun->queue = trim((string) $lockedRun->queue) !== ''
+                ? $lockedRun->queue
+                : 'facebook';
 
-            /*
-             * Clear cancellation information from the new attempt.
-             */
-            unset($metadata['cancellation']);
+            $lockedRun->job_id = null;
+            $lockedRun->started_at = null;
+            $lockedRun->last_heartbeat_at = null;
+            $lockedRun->completed_at = null;
+            $lockedRun->finished_at = null;
+            $lockedRun->error_message = null;
+            $lockedRun->queued_at = $now;
 
-            $lockedRun->metadata =
-                $metadata;
-
-            /*
-             * Return the existing SyncRun to QUEUED.
-             */
-            $lockedRun->status =
-                FacebookSyncStatus::QUEUED;
-
-            $lockedRun->queue =
-                $lockedRun->queue
-                ?: 'facebook';
-
-            /*
-             * The next worker attempt will increment attempts
-             * through markRunning().
-             */
-            $lockedRun->job_id =
-                null;
-
-            $lockedRun->started_at =
-                null;
-
-            $lockedRun->completed_at =
-                null;
-
-            $lockedRun->error_message =
-                null;
-
-            /*
-             * queued_at represents this retry request.
-             */
-            $lockedRun->queued_at =
-                now();
-
+            // Attempts are incremented when the worker actually starts.
             $lockedRun->save();
 
             return $lockedRun->refresh();
@@ -528,9 +481,9 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Initialize asynchronous pipeline tracking.
+     * Initialize asynchronous pipeline tracking exactly once.
      *
-     * Initialization is idempotent.
+     * @param array<string, mixed> $counters
      */
     public function initializePipeline(
         string $runId,
@@ -545,32 +498,22 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            if (
-                $run->status !== FacebookSyncStatus::RUNNING
-            ) {
-                throw ValidationException::withMessages([
-                    'status' => [
-                        "Cannot initialize pipeline for a sync run with status '{$run->status->value}'.",
-                    ],
-                ]);
+            $this->assertPipelineWritable($run);
+
+            // Validate every supplied value before changing metadata.
+            foreach ($counters as $key => $value) {
+                $this->validatePipelineCounter($key, $value);
             }
 
             $metadata = is_array($run->metadata)
                 ? $run->metadata
                 : [];
 
-            $pipeline = is_array(
-                $metadata['pipeline'] ?? null,
-            )
+            $pipeline = is_array($metadata['pipeline'] ?? null)
                 ? $metadata['pipeline']
                 : [];
 
-            /*
-             * If already initialized, preserve the counters.
-             */
-            if (
-                ($pipeline['initialized'] ?? false) === true
-            ) {
+            if (($pipeline['initialized'] ?? false) === true) {
                 return $run->refresh();
             }
 
@@ -579,31 +522,21 @@ final class FacebookSyncRunService
             }
 
             foreach ($counters as $key => $value) {
-                $this->validatePipelineCounter(
-                    $key,
-                    $value,
-                );
-
                 $pipeline[$key] = $value;
             }
 
+            $now = now();
+
             $pipeline['operations'] = [];
+            $pipeline['initialized'] = true;
+            $pipeline['initialized_at'] = $now->toIso8601String();
+            $pipeline['completed'] = false;
+            unset($pipeline['completed_at']);
 
-            $pipeline['initialized'] =
-                true;
+            $metadata['pipeline'] = $pipeline;
 
-            $pipeline['initialized_at'] =
-                now()->toIso8601String();
-
-            $pipeline['completed'] =
-                false;
-
-            $metadata['pipeline'] =
-                $pipeline;
-
-            $run->metadata =
-                $metadata;
-
+            $run->metadata = $metadata;
+            $run->last_heartbeat_at = $now;
             $run->save();
 
             return $run->refresh();
@@ -617,7 +550,11 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Increment asynchronous pipeline counters atomically.
+     * Increment pipeline counters.
+     *
+     * The row lock serializes read-modify-write updates to JSON metadata.
+     *
+     * @param array<string, mixed> $counters
      */
     public function incrementPipeline(
         string $runId,
@@ -632,33 +569,26 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            $this->assertPipelineWritable(
-                $run,
-            );
+            $this->assertPipelineWritable($run);
+
+            foreach ($counters as $key => $value) {
+                $this->validatePipelineCounter($key, $value);
+            }
 
             $metadata = is_array($run->metadata)
                 ? $run->metadata
                 : [];
 
-            $pipeline = $this->getPipelineMetadata(
-                $metadata,
-            );
+            $pipeline = $this->getPipelineMetadata($metadata);
 
             foreach ($counters as $key => $value) {
-                $this->validatePipelineCounter(
-                    $key,
-                    $value,
-                );
-
                 $pipeline[$key] += $value;
             }
 
-            $metadata['pipeline'] =
-                $pipeline;
+            $metadata['pipeline'] = $pipeline;
 
-            $run->metadata =
-                $metadata;
-
+            $run->metadata = $metadata;
+            $run->last_heartbeat_at = now();
             $run->save();
 
             return $run->refresh();
@@ -672,81 +602,63 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Increment pipeline counters exactly once for an operation.
+     * Increment pipeline counters once per operation key.
      *
-     * @return array{
-     *     run: FacebookSyncRun,
-     *     applied: bool
-     * }
+     * @param array<string, mixed> $counters
+     * @return array{run: FacebookSyncRun, applied: bool}
      */
     public function incrementPipelineOnce(
         string $runId,
         string $operationKey,
         array $counters,
     ): array {
+        $operationKey = trim($operationKey);
+
+        if ($operationKey === '') {
+            throw ValidationException::withMessages([
+                'operation_key' => [
+                    'The pipeline operation key cannot be empty.',
+                ],
+            ]);
+        }
+
+        if (strlen($operationKey) > 255) {
+            throw ValidationException::withMessages([
+                'operation_key' => [
+                    'The pipeline operation key cannot exceed 255 characters.',
+                ],
+            ]);
+        }
+
         return DB::transaction(function () use (
             $runId,
             $operationKey,
             $counters,
         ): array {
-            $operationKey = trim(
-                $operationKey,
-            );
-
-            if ($operationKey === '') {
-                throw ValidationException::withMessages([
-                    'operation_key' => [
-                        'The pipeline operation key cannot be empty.',
-                    ],
-                ]);
-            }
-
             /** @var FacebookSyncRun $run */
             $run = FacebookSyncRun::query()
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            $this->assertPipelineWritable(
-                $run,
-            );
+            $this->assertPipelineWritable($run);
+
+            foreach ($counters as $key => $value) {
+                $this->validatePipelineCounter($key, $value);
+            }
 
             $metadata = is_array($run->metadata)
                 ? $run->metadata
                 : [];
 
-            $pipeline = $this->getPipelineMetadata(
-                $metadata,
-            );
+            $pipeline = $this->getPipelineMetadata($metadata);
 
-            $operations = is_array(
-                $pipeline['operations'] ?? null,
-            )
-                ? $pipeline['operations']
-                : [];
+            $operations = $pipeline['operations'];
 
-            /*
-             * Critical idempotency guard.
-             */
-            if (
-                isset($operations[$operationKey])
-            ) {
+            if (isset($operations[$operationKey])) {
                 return [
-                    'run' =>
-                        $run->refresh(),
-
-                    'applied' =>
-                        false,
+                    'run' => $run->refresh(),
+                    'applied' => false,
                 ];
-            }
-
-            /*
-             * Validate all counters before mutation.
-             */
-            foreach ($counters as $key => $value) {
-                $this->validatePipelineCounter(
-                    $key,
-                    $value,
-                );
             }
 
             foreach ($counters as $key => $value) {
@@ -754,17 +666,10 @@ final class FacebookSyncRunService
             }
 
             $operations[$operationKey] = [
-                'recorded_at' =>
-                    now()->toIso8601String(),
+                'recorded_at' => now()->toIso8601String(),
             ];
 
-            /*
-             * Prevent unbounded metadata growth.
-             */
-            if (
-                count($operations)
-                > self::MAX_PIPELINE_OPERATION_KEYS
-            ) {
+            if (count($operations) > self::MAX_PIPELINE_OPERATION_KEYS) {
                 $operations = array_slice(
                     $operations,
                     -self::MAX_PIPELINE_OPERATION_KEYS,
@@ -773,53 +678,49 @@ final class FacebookSyncRunService
                 );
             }
 
-            $pipeline['operations'] =
-                $operations;
+            $pipeline['operations'] = $operations;
+            $metadata['pipeline'] = $pipeline;
 
-            $metadata['pipeline'] =
-                $pipeline;
-
-            $run->metadata =
-                $metadata;
-
+            $run->metadata = $metadata;
+            $run->last_heartbeat_at = now();
             $run->save();
 
             return [
-                'run' =>
-                    $run->refresh(),
-
-                'applied' =>
-                    true,
+                'run' => $run->refresh(),
+                'applied' => true,
             ];
         }, attempts: 3);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Mark Pipeline Jobs Completed
+    | Pipeline Job Completion
     |--------------------------------------------------------------------------
     */
 
     /**
-     * Mark one or more downstream pipeline jobs as completed.
+     * Record downstream pipeline job outcomes.
+     *
+     * Example:
+     * [
+     *     'comment_jobs_completed' => 1,
+     *     'comment_jobs_failed' => 0,
+     * ]
+     *
+     * @param array<string, mixed> $counters
      */
     public function markPipelineJobsCompleted(
         string $runId,
         array $counters,
     ): FacebookSyncRun {
-        return $this->incrementPipeline(
-            $runId,
-            $counters,
-        );
+        return $this->incrementPipeline($runId, $counters);
     }
 
     /**
-     * Mark a downstream pipeline operation as completed exactly once.
+     * Record a downstream pipeline operation exactly once.
      *
-     * @return array{
-     *     run: FacebookSyncRun,
-     *     applied: bool
-     * }
+     * @param array<string, mixed> $counters
+     * @return array{run: FacebookSyncRun, applied: bool}
      */
     public function markPipelineJobCompletedOnce(
         string $runId,
@@ -839,9 +740,6 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Determine whether the asynchronous pipeline was initialized.
-     */
     public function isPipelineInitialized(
         FacebookSyncRun $run,
     ): bool {
@@ -849,19 +747,14 @@ final class FacebookSyncRunService
             ? $run->metadata
             : [];
 
-        $pipeline = is_array(
-            $metadata['pipeline'] ?? null,
-        )
+        $pipeline = is_array($metadata['pipeline'] ?? null)
             ? $metadata['pipeline']
             : [];
 
-        return ($pipeline['initialized'] ?? false)
-            === true;
+        return ($pipeline['initialized'] ?? false) === true;
     }
 
     /**
-     * Return normalized pipeline metadata.
-     *
      * @return array<string, mixed>
      */
     public function getPipeline(
@@ -871,9 +764,7 @@ final class FacebookSyncRunService
             ? $run->metadata
             : [];
 
-        return $this->getPipelineMetadata(
-            $metadata,
-        );
+        return $this->getPipelineMetadata($metadata);
     }
 
     /*
@@ -883,90 +774,43 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Determine whether all expected downstream work is finished.
+     * Return true when all expected downstream jobs have finished.
      *
-     * A pipeline is complete when:
-     *
-     * expected <= completed + failed
-     *
-     * for every asynchronous job category.
+     * A job is considered finished if it completed successfully or failed.
      */
     public function isPipelineComplete(
         FacebookSyncRun $run,
     ): bool {
-        $pipeline = $this->getPipeline(
-            $run,
-        );
+        $pipeline = $this->getPipeline($run);
 
-        if (
-            ($pipeline['initialized'] ?? false)
-            !== true
-        ) {
+        if (($pipeline['initialized'] ?? false) !== true) {
             return false;
         }
 
         $groups = [
             [
-                'expected' =>
-                    'comment_jobs_expected',
-
-                'completed' =>
-                    'comment_jobs_completed',
-
-                'failed' =>
-                    'comment_jobs_failed',
+                'expected' => 'comment_jobs_expected',
+                'completed' => 'comment_jobs_completed',
+                'failed' => 'comment_jobs_failed',
             ],
             [
-                'expected' =>
-                    'post_ai_jobs_expected',
-
-                'completed' =>
-                    'post_ai_jobs_completed',
-
-                'failed' =>
-                    'post_ai_jobs_failed',
+                'expected' => 'post_ai_jobs_expected',
+                'completed' => 'post_ai_jobs_completed',
+                'failed' => 'post_ai_jobs_failed',
             ],
             [
-                'expected' =>
-                    'comment_ai_jobs_expected',
-
-                'completed' =>
-                    'comment_ai_jobs_completed',
-
-                'failed' =>
-                    'comment_ai_jobs_failed',
+                'expected' => 'comment_ai_jobs_expected',
+                'completed' => 'comment_ai_jobs_completed',
+                'failed' => 'comment_ai_jobs_failed',
             ],
         ];
 
         foreach ($groups as $group) {
-            $expected = max(
-                0,
-                (int) (
-                    $pipeline[$group['expected']]
-                    ?? 0
-                ),
-            );
+            $expected = (int) $pipeline[$group['expected']];
+            $completed = (int) $pipeline[$group['completed']];
+            $failed = (int) $pipeline[$group['failed']];
 
-            $completed = max(
-                0,
-                (int) (
-                    $pipeline[$group['completed']]
-                    ?? 0
-                ),
-            );
-
-            $failed = max(
-                0,
-                (int) (
-                    $pipeline[$group['failed']]
-                    ?? 0
-                ),
-            );
-
-            if (
-                ($completed + $failed)
-                < $expected
-            ) {
+            if (($completed + $failed) < $expected) {
                 return false;
             }
         }
@@ -975,8 +819,7 @@ final class FacebookSyncRunService
     }
 
     /**
-     * Complete the synchronization run if all downstream
-     * pipeline work has finished.
+     * Complete the run when all downstream pipeline jobs have finished.
      */
     public function completePipelineIfReady(
         string $runId,
@@ -989,54 +832,36 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            /*
-             * Terminal states are immutable.
-             */
             if ($run->isTerminal()) {
                 return $run;
             }
 
-            if (
-                $run->status
-                !== FacebookSyncStatus::RUNNING
-            ) {
+            if ($run->status !== FacebookSyncStatus::RUNNING) {
                 return $run;
             }
 
-            if (
-                ! $this->isPipelineComplete($run)
-            ) {
+            if (! $this->isPipelineComplete($run)) {
                 return $run;
             }
+
+            $now = now();
 
             $metadata = is_array($run->metadata)
                 ? $run->metadata
                 : [];
 
-            $pipeline = $this->getPipelineMetadata(
-                $metadata,
-            );
+            $pipeline = $this->getPipelineMetadata($metadata);
+            $pipeline['completed'] = true;
+            $pipeline['completed_at'] = $now->toIso8601String();
 
-            $pipeline['completed'] =
-                true;
+            $metadata['pipeline'] = $pipeline;
 
-            $pipeline['completed_at'] =
-                now()->toIso8601String();
-
-            $metadata['pipeline'] =
-                $pipeline;
-
-            $run->metadata =
-                $metadata;
-
-            $run->status =
-                FacebookSyncStatus::COMPLETED;
-
-            $run->completed_at =
-                now();
-
-            $run->error_message =
-                null;
+            $run->metadata = $metadata;
+            $run->status = FacebookSyncStatus::COMPLETED;
+            $run->completed_at = $now;
+            $run->finished_at = $now;
+            $run->last_heartbeat_at = $now;
+            $run->error_message = null;
 
             $run->save();
 
@@ -1051,7 +876,11 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Increment one or more synchronization statistics.
+     * Increment synchronization statistics.
+     *
+     * All values are validated before any in-memory mutation.
+     *
+     * @param array<string, mixed> $statistics
      */
     public function incrementStatistics(
         string $runId,
@@ -1066,25 +895,18 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            if (
-                $run->status
-                !== FacebookSyncStatus::RUNNING
-            ) {
-                throw ValidationException::withMessages([
-                    'status' => [
-                        "Cannot update statistics for a sync run with status '{$run->status->value}'.",
-                    ],
-                ]);
+            $this->assertStatisticsWritable($run);
+
+            foreach ($statistics as $key => $value) {
+                $this->validateStatistic($key, $value);
             }
 
             foreach ($statistics as $key => $value) {
-                $this->validateStatistic(
-                    $key,
-                    $value,
-                );
+                $run->{$key} = ((int) $run->{$key}) + $value;
+            }
 
-                $run->{$key} =
-                    ((int) $run->{$key}) + $value;
+            if ($statistics !== []) {
+                $run->last_heartbeat_at = now();
             }
 
             $run->save();
@@ -1095,6 +917,10 @@ final class FacebookSyncRunService
 
     /**
      * Set synchronization statistics to exact values.
+     *
+     * Only running runs may be modified.
+     *
+     * @param array<string, mixed> $statistics
      */
     public function setStatistics(
         string $runId,
@@ -1109,14 +935,18 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            foreach ($statistics as $key => $value) {
-                $this->validateStatistic(
-                    $key,
-                    $value,
-                );
+            $this->assertStatisticsWritable($run);
 
-                $run->{$key} =
-                    $value;
+            foreach ($statistics as $key => $value) {
+                $this->validateStatistic($key, $value);
+            }
+
+            foreach ($statistics as $key => $value) {
+                $run->{$key} = $value;
+            }
+
+            if ($statistics !== []) {
+                $run->last_heartbeat_at = now();
             }
 
             $run->save();
@@ -1133,6 +963,13 @@ final class FacebookSyncRunService
 
     /**
      * Update run metadata.
+     *
+     * This method intentionally allows metadata updates on terminal runs,
+     * for example to attach diagnostic information after a worker failure.
+     * Callers must not use it to change lifecycle fields or overwrite
+     * pipeline state without appropriate validation.
+     *
+     * @param array<string, mixed> $metadata
      */
     public function updateMetadata(
         string $runId,
@@ -1154,10 +991,7 @@ final class FacebookSyncRunService
                 : [];
 
             $run->metadata = $merge
-                ? array_replace_recursive(
-                    $existing,
-                    $metadata,
-                )
+                ? array_replace_recursive($existing, $metadata)
                 : $metadata;
 
             $run->save();
@@ -1173,10 +1007,12 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Mark a running synchronization run as completed.
+     * Mark a running synchronization as successfully completed.
      *
-     * This method should only be used when there is no asynchronous
-     * downstream pipeline remaining.
+     * Use only when there is no asynchronous downstream pipeline work
+     * remaining. Otherwise, use completePipelineIfReady().
+     *
+     * @param array<string, mixed> $statistics
      */
     public function markCompleted(
         string $runId,
@@ -1191,10 +1027,7 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            if (
-                $run->status
-                !== FacebookSyncStatus::RUNNING
-            ) {
+            if ($run->status !== FacebookSyncStatus::RUNNING) {
                 throw ValidationException::withMessages([
                     'status' => [
                         "Cannot complete a sync run with status '{$run->status->value}'.",
@@ -1203,23 +1036,20 @@ final class FacebookSyncRunService
             }
 
             foreach ($statistics as $key => $value) {
-                $this->validateStatistic(
-                    $key,
-                    $value,
-                );
-
-                $run->{$key} =
-                    $value;
+                $this->validateStatistic($key, $value);
             }
 
-            $run->status =
-                FacebookSyncStatus::COMPLETED;
+            foreach ($statistics as $key => $value) {
+                $run->{$key} = $value;
+            }
 
-            $run->completed_at =
-                now();
+            $now = now();
 
-            $run->error_message =
-                null;
+            $run->status = FacebookSyncStatus::COMPLETED;
+            $run->completed_at = $now;
+            $run->finished_at = $now;
+            $run->last_heartbeat_at = $now;
+            $run->error_message = null;
 
             $run->save();
 
@@ -1234,7 +1064,10 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Mark a queued or running synchronization run as failed.
+     * Mark a queued or running run as failed.
+     *
+     * Terminal runs are immutable; late failures from already-finished
+     * jobs do not overwrite their final status.
      */
     public function markFailed(
         string $runId,
@@ -1249,39 +1082,34 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($runId);
 
-            /*
-             * Terminal states are immutable.
-             *
-             * This includes CANCELLED.
-             */
             if ($run->isTerminal()) {
                 return $run;
             }
 
-            $message = $error instanceof Throwable
-                ? $error->getMessage()
-                : $error;
-
-            $message =
-                trim($message);
+            $message = trim(
+                $error instanceof Throwable
+                    ? $error->getMessage()
+                    : $error,
+            );
 
             if ($message === '') {
-                $message =
-                    'Unknown synchronization error.';
+                $message = 'Unknown synchronization error.';
             }
 
-            $run->status =
-                FacebookSyncStatus::FAILED;
+            $now = now();
 
-            $run->completed_at =
-                now();
+            $run->status = FacebookSyncStatus::FAILED;
 
-            $run->error_message =
-                Str::limit(
-                    $message,
-                    10000,
-                    '...',
-                );
+            // A failure is not a successful completion.
+            $run->completed_at = null;
+            $run->finished_at = $now;
+            $run->last_heartbeat_at = $now;
+
+            $run->error_message = Str::limit(
+                $message,
+                10000,
+                '...',
+            );
 
             $run->save();
 
@@ -1295,35 +1123,36 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Retrieve a synchronization run.
-     */
-    public function find(
-        string $runId,
-    ): FacebookSyncRun {
-        return FacebookSyncRun::query()
-            ->findOrFail($runId);
+    public function find(string $runId): FacebookSyncRun
+    {
+        return FacebookSyncRun::query()->findOrFail($runId);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Internal Pipeline Helpers
+    | Internal Helpers
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Assert that a pipeline can still be modified.
-     */
     private function assertPipelineWritable(
         FacebookSyncRun $run,
     ): void {
-        if (
-            $run->status
-            !== FacebookSyncStatus::RUNNING
-        ) {
+        if ($run->status !== FacebookSyncStatus::RUNNING) {
             throw ValidationException::withMessages([
                 'status' => [
                     "Cannot update pipeline for a sync run with status '{$run->status->value}'.",
+                ],
+            ]);
+        }
+    }
+
+    private function assertStatisticsWritable(
+        FacebookSyncRun $run,
+    ): void {
+        if ($run->status !== FacebookSyncStatus::RUNNING) {
+            throw ValidationException::withMessages([
+                'status' => [
+                    "Cannot update statistics for a sync run with status '{$run->status->value}'.",
                 ],
             ]);
         }
@@ -1335,39 +1164,29 @@ final class FacebookSyncRunService
      * @param array<string, mixed> $metadata
      * @return array<string, mixed>
      */
-    private function getPipelineMetadata(
-        array $metadata,
-    ): array {
-        $pipeline = is_array(
-            $metadata['pipeline'] ?? null,
-        )
+    private function getPipelineMetadata(array $metadata): array
+    {
+        $pipeline = is_array($metadata['pipeline'] ?? null)
             ? $metadata['pipeline']
             : [];
 
         foreach (self::PIPELINE_COUNTERS as $counter) {
-            $pipeline[$counter] =
-                isset($pipeline[$counter])
-                    ? max(
-                        0,
-                        (int) $pipeline[$counter],
-                    )
-                    : 0;
+            $pipeline[$counter] = isset($pipeline[$counter])
+                ? max(0, (int) $pipeline[$counter])
+                : 0;
         }
 
-        $pipeline['operations'] =
-            is_array(
-                $pipeline['operations'] ?? null,
-            )
-                ? $pipeline['operations']
-                : [];
+        $pipeline['operations'] = is_array(
+            $pipeline['operations'] ?? null,
+        )
+            ? $pipeline['operations']
+            : [];
 
         $pipeline['initialized'] =
-            ($pipeline['initialized'] ?? false)
-            === true;
+            ($pipeline['initialized'] ?? false) === true;
 
         $pipeline['completed'] =
-            ($pipeline['completed'] ?? false)
-            === true;
+            ($pipeline['completed'] ?? false) === true;
 
         return $pipeline;
     }
@@ -1378,20 +1197,11 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Validate a synchronization statistic.
-     */
     private function validateStatistic(
         string $key,
         mixed $value,
     ): void {
-        if (
-            ! in_array(
-                $key,
-                self::STATISTIC_FIELDS,
-                true,
-            )
-        ) {
+        if (! in_array($key, self::STATISTIC_FIELDS, true)) {
             throw ValidationException::withMessages([
                 "statistics.{$key}" => [
                     'Unsupported synchronization statistic.',
@@ -1399,10 +1209,7 @@ final class FacebookSyncRunService
             ]);
         }
 
-        if (
-            ! is_int($value)
-            || $value < 0
-        ) {
+        if (! is_int($value) || $value < 0) {
             throw ValidationException::withMessages([
                 "statistics.{$key}" => [
                     'The statistic must be a non-negative integer.',
@@ -1411,20 +1218,11 @@ final class FacebookSyncRunService
         }
     }
 
-    /**
-     * Validate a pipeline counter.
-     */
     private function validatePipelineCounter(
         string $key,
         mixed $value,
     ): void {
-        if (
-            ! in_array(
-                $key,
-                self::PIPELINE_COUNTERS,
-                true,
-            )
-        ) {
+        if (! in_array($key, self::PIPELINE_COUNTERS, true)) {
             throw ValidationException::withMessages([
                 "pipeline.{$key}" => [
                     'Unsupported pipeline counter.',
@@ -1432,10 +1230,7 @@ final class FacebookSyncRunService
             ]);
         }
 
-        if (
-            ! is_int($value)
-            || $value < 0
-        ) {
+        if (! is_int($value) || $value < 0) {
             throw ValidationException::withMessages([
                 "pipeline.{$key}" => [
                     'The pipeline counter must be a non-negative integer.',

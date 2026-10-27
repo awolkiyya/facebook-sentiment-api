@@ -18,10 +18,8 @@ return new class extends Migration
             | Primary Key
             |--------------------------------------------------------------------------
             |
-            | Application-level synchronization ID.
-            |
-            | Do NOT use the Laravel queue job ID as the primary identifier
-            | for a synchronization run.
+            | Application-level synchronization run identifier.
+            | This is independent of Laravel's queue job identifier.
             |
             */
             $table->uuid('id')->primary();
@@ -31,9 +29,12 @@ return new class extends Migration
             | Facebook Page
             |--------------------------------------------------------------------------
             |
-            | References the local facebook_pages.id UUID.
+            | References the local facebook_pages.id UUID,
+            | not the external Meta/Facebook Page ID.
             |
-            | This is NOT the external Meta/Facebook Page ID.
+            | Page deletion cascades to synchronization history.
+            | If audit retention is required after disconnection, change
+            | this deletion policy before deploying the migration.
             |
             */
             $table->foreignUuid('facebook_page_id')
@@ -45,9 +46,8 @@ return new class extends Migration
             | Triggering User
             |--------------------------------------------------------------------------
             |
-            | NULL when triggered automatically by scheduler/system.
-            |
-            | Set when a user manually starts synchronization.
+            | NULL for scheduler/system-triggered runs.
+            | Set for manually initiated runs.
             |
             */
             $table->foreignUuid('triggered_by_user_id')
@@ -57,18 +57,14 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | Synchronization Trigger
+            | Trigger
             |--------------------------------------------------------------------------
             |
-            | manual    → user explicitly requested synchronization
-            | scheduler → scheduled/automated synchronization
-            | system    → internal application/system synchronization
+            | manual    = explicitly requested by a user
+            | scheduler = initiated by an automated schedule
+            | system    = initiated by internal application logic
             |
-            | IMPORTANT:
-            | "retry" is intentionally NOT a trigger.
-            |
-            | If a manually triggered job fails and Laravel retries it,
-            | the synchronization still remains "manual".
+            | Retries do not change the original trigger.
             |
             */
             $table->enum('trigger', [
@@ -82,10 +78,12 @@ return new class extends Migration
             | Synchronization Type
             |--------------------------------------------------------------------------
             |
-            | full        → posts + comments + downstream processing
-            | posts       → Facebook posts synchronization
-            | comments    → Facebook comments synchronization
-            | incremental → incremental synchronization
+            | full        = posts, comments, and downstream processing
+            | posts       = post synchronization
+            | comments    = comment synchronization
+            | incremental = incremental synchronization
+            |
+            | Actual behavior must be implemented by the corresponding jobs.
             |
             */
             $table->enum('type', [
@@ -97,13 +95,17 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | Status
+            | Synchronization Status
             |--------------------------------------------------------------------------
             |
-            | queued    → run created and waiting for queue worker
-            | running   → worker has started processing
-            | completed → synchronization finished successfully
-            | failed    → synchronization failed after retries/execution
+            | queued    = waiting for execution
+            | running   = synchronization job is executing
+            | completed = synchronization work completed successfully
+            | failed    = synchronization reached terminal failure
+            |
+            | IMPORTANT:
+            | completed does not necessarily mean all downstream AI jobs
+            | have completed. AI processing is tracked separately.
             |
             */
             $table->enum('status', [
@@ -118,15 +120,10 @@ return new class extends Migration
             | Queue Information
             |--------------------------------------------------------------------------
             |
-            | queue:
-            |   Logical Laravel queue used for this synchronization.
+            | queue  = Laravel queue assigned to this synchronization job
+            | job_id = Laravel queue job identifier, when available
             |
-            | job_id:
-            |   Laravel queue job identifier.
-            |
-            | job_id is diagnostic information only.
-            | The application should use facebook_sync_runs.id as the
-            | synchronization identifier.
+            | facebook_sync_runs.id remains the application-level run ID.
             |
             */
             $table->string('queue', 100)
@@ -140,25 +137,26 @@ return new class extends Migration
             | Execution Attempts
             |--------------------------------------------------------------------------
             |
-            | Number of times the synchronization job has attempted execution.
+            | Number of execution attempts recorded by the application.
+            | Must be updated explicitly by the job/tracking logic.
             |
             */
-            $table->unsignedTinyInteger('attempts')
+            $table->unsignedInteger('attempts')
                 ->default(0);
 
             /*
             |--------------------------------------------------------------------------
-            | Timing
+            | Lifecycle Timestamps
             |--------------------------------------------------------------------------
             |
-            | queued_at:
-            |   When the synchronization run was created.
+            | queued_at          = when the run was created/queued
+            | started_at         = when execution first started
+            | last_heartbeat_at  = last recorded execution progress
+            | completed_at       = successful completion time
+            | finished_at        = terminal completion or failure time
             |
-            | started_at:
-            |   When the queue worker actually started processing.
-            |
-            | completed_at:
-            |   When the synchronization finished successfully.
+            | Heartbeats must be maintained by the running job.
+            | These fields do not update automatically.
             |
             */
             $table->timestamp('queued_at')
@@ -167,15 +165,24 @@ return new class extends Migration
             $table->timestamp('started_at')
                 ->nullable();
 
+            $table->timestamp('last_heartbeat_at')
+                ->nullable();
+
             $table->timestamp('completed_at')
+                ->nullable();
+
+            $table->timestamp('finished_at')
                 ->nullable();
 
             /*
             |--------------------------------------------------------------------------
-            | Post Statistics
+            | Post Synchronization Statistics
             |--------------------------------------------------------------------------
+            |
+            | Define fetched as records retrieved from Meta.
+            | Created/updated represent local persistence results.
+            |
             */
-
             $table->unsignedInteger('posts_fetched')
                 ->default(0);
 
@@ -187,10 +194,10 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | Comment Statistics
+            | Comment Synchronization Statistics
             |--------------------------------------------------------------------------
+            |
             */
-
             $table->unsignedInteger('comments_fetched')
                 ->default(0);
 
@@ -205,20 +212,34 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | AI Processing Statistics
+            | AI Dispatch Statistics
             |--------------------------------------------------------------------------
             |
-            | These counters represent downstream AI work associated with
-            | this synchronization run.
+            | Count of unique post/comment analysis tasks dispatched for
+            | this run, according to the application's counting policy.
+            |
+            | These are not counts of posts/comments fetched.
             |
             */
-
             $table->unsignedInteger('posts_queued_for_ai')
                 ->default(0);
 
             $table->unsignedInteger('comments_queued_for_ai')
                 ->default(0);
 
+            /*
+            |--------------------------------------------------------------------------
+            | AI Processing Outcomes
+            |--------------------------------------------------------------------------
+            |
+            | Track final task outcomes, not every intermediate retry.
+            |
+            | These counters can be updated after the synchronization job
+            | finishes, because AI jobs may execute asynchronously.
+            |
+            | Use atomic/idempotent updates to avoid double counting.
+            |
+            */
             $table->unsignedInteger('ai_completed')
                 ->default(0);
 
@@ -227,10 +248,11 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | Error Information
+            | Synchronization Error
             |--------------------------------------------------------------------------
             |
-            | Stores the final failure reason when the synchronization fails.
+            | Store a sanitized final synchronization error.
+            | Avoid access tokens, credentials, and sensitive payloads.
             |
             */
             $table->text('error_message')
@@ -238,22 +260,19 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | Additional Metadata
+            | Diagnostic Metadata
             |--------------------------------------------------------------------------
             |
-            | Useful for storing non-critical execution information without
-            | continuously changing the schema.
+            | Supplemental non-sensitive execution details.
             |
             | Example:
-            |
             | {
             |     "graph_api_version": "v26.0",
-            |     "pages_processed": 12,
             |     "pagination_pages": 15,
             |     "duration_seconds": 42
             | }
             |
-            | Do NOT store access tokens or other secrets here.
+            | Keep frequently queried values in dedicated columns.
             |
             */
             $table->json('metadata')
@@ -261,7 +280,7 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | Timestamps
+            | Record Timestamps
             |--------------------------------------------------------------------------
             */
             $table->timestamps();
@@ -272,56 +291,58 @@ return new class extends Migration
             |--------------------------------------------------------------------------
             */
 
-            /*
-            | Page synchronization history.
-            |
-            | Useful for:
-            |
-            |   WHERE facebook_page_id = ?
-            |   ORDER BY created_at DESC
-            |
-            */
-            $table->index([
-                'facebook_page_id',
-                'created_at',
-            ]);
+            // Page synchronization history.
+            $table->index(
+                ['facebook_page_id', 'created_at'],
+                'fsr_page_created_idx'
+            );
 
-            /*
-            | Find currently queued/running synchronization runs
-            | for a specific Facebook Page.
-            */
-            $table->index([
-                'facebook_page_id',
+            // Filter and inspect runs by Page and status.
+            $table->index(
+                ['facebook_page_id', 'status'],
+                'fsr_page_status_idx'
+            );
+
+            // User synchronization history.
+            $table->index(
+                ['triggered_by_user_id', 'created_at'],
+                'fsr_user_created_idx'
+            );
+
+            // Administrative status filtering.
+            $table->index(
                 'status',
-            ]);
+                'fsr_status_idx'
+            );
 
-            /*
-            | Useful for synchronization history by user.
-            */
-            $table->index([
-                'triggered_by_user_id',
-                'created_at',
-            ]);
+            // Filter by manual/scheduled/system trigger.
+            $table->index(
+                'trigger',
+                'fsr_trigger_idx'
+            );
 
-            /*
-            | Useful for administrative filtering by status.
-            */
-            $table->index('status');
+            // Queue diagnostics.
+            $table->index(
+                'job_id',
+                'fsr_job_id_idx'
+            );
 
-            /*
-            | Useful for filtering by trigger.
-            */
-            $table->index('trigger');
+            $table->index(
+                'queue',
+                'fsr_queue_idx'
+            );
 
-            /*
-            | Useful for locating a Laravel queue job.
-            */
-            $table->index('job_id');
+            // Find old queued runs.
+            $table->index(
+                ['status', 'queued_at'],
+                'fsr_status_queued_idx'
+            );
 
-            /*
-            | Useful for queue monitoring/filtering.
-            */
-            $table->index('queue');
+            // Find potentially stalled running jobs.
+            $table->index(
+                ['status', 'last_heartbeat_at'],
+                'fsr_status_heartbeat_idx'
+            );
         });
     }
 

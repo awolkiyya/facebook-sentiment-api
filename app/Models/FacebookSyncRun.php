@@ -7,10 +7,12 @@ namespace App\Models;
 use App\Enums\FacebookSyncStatus;
 use App\Enums\FacebookSyncTrigger;
 use App\Enums\FacebookSyncType;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use InvalidArgumentException;
 
 class FacebookSyncRun extends Model
 {
@@ -19,17 +21,11 @@ class FacebookSyncRun extends Model
 
     /*
     |--------------------------------------------------------------------------
-    | Table
+    | Table Configuration
     |--------------------------------------------------------------------------
     */
 
     protected $table = 'facebook_sync_runs';
-
-    /*
-    |--------------------------------------------------------------------------
-    | Primary Key
-    |--------------------------------------------------------------------------
-    */
 
     protected $primaryKey = 'id';
 
@@ -41,6 +37,11 @@ class FacebookSyncRun extends Model
     |--------------------------------------------------------------------------
     | Mass Assignment
     |--------------------------------------------------------------------------
+    |
+    | Internal lifecycle methods use forceFill().
+    | These attributes are not intended to be mass-assigned directly
+    | from untrusted HTTP request data.
+    |
     */
 
     protected $fillable = [
@@ -54,7 +55,9 @@ class FacebookSyncRun extends Model
         'attempts',
         'queued_at',
         'started_at',
+        'last_heartbeat_at',
         'completed_at',
+        'finished_at',
         'posts_fetched',
         'posts_created',
         'posts_updated',
@@ -79,35 +82,21 @@ class FacebookSyncRun extends Model
     protected function casts(): array
     {
         return [
-            /*
-            |--------------------------------------------------------------------------
-            | Enums
-            |--------------------------------------------------------------------------
-            */
-
             'trigger' => FacebookSyncTrigger::class,
 
             'type' => FacebookSyncType::class,
 
             'status' => FacebookSyncStatus::class,
 
-            /*
-            |--------------------------------------------------------------------------
-            | Dates
-            |--------------------------------------------------------------------------
-            */
+            'queued_at' => 'immutable_datetime',
 
-            'queued_at' => 'datetime',
+            'started_at' => 'immutable_datetime',
 
-            'started_at' => 'datetime',
+            'last_heartbeat_at' => 'immutable_datetime',
 
-            'completed_at' => 'datetime',
+            'completed_at' => 'immutable_datetime',
 
-            /*
-            |--------------------------------------------------------------------------
-            | Integers
-            |--------------------------------------------------------------------------
-            */
+            'finished_at' => 'immutable_datetime',
 
             'attempts' => 'integer',
 
@@ -133,12 +122,6 @@ class FacebookSyncRun extends Model
 
             'ai_failed' => 'integer',
 
-            /*
-            |--------------------------------------------------------------------------
-            | JSON
-            |--------------------------------------------------------------------------
-            */
-
             'metadata' => 'array',
         ];
     }
@@ -151,9 +134,6 @@ class FacebookSyncRun extends Model
 
     /**
      * Facebook Page associated with this synchronization run.
-     *
-     * facebook_sync_runs.facebook_page_id
-     *      -> facebook_pages.id
      */
     public function facebookPage(): BelongsTo
     {
@@ -165,12 +145,10 @@ class FacebookSyncRun extends Model
     }
 
     /**
-     * User who triggered the synchronization.
+     * User who initiated the synchronization.
      *
-     * NULL for scheduler/system-triggered synchronization.
-     *
-     * facebook_sync_runs.triggered_by_user_id
-     *      -> users.id
+     * Returns null when the run was triggered automatically
+     * or when the triggering user has been deleted.
      */
     public function triggeredByUser(): BelongsTo
     {
@@ -183,83 +161,97 @@ class FacebookSyncRun extends Model
 
     /*
     |--------------------------------------------------------------------------
-    | Status Helpers
+    | Query Scopes
     |--------------------------------------------------------------------------
     */
 
     /**
-     * Determine whether the synchronization is queued.
+     * Restrict a query to queued synchronization runs.
      */
+    public function scopeQueued(Builder $query): Builder
+    {
+        return $query->where(
+            'status',
+            FacebookSyncStatus::QUEUED->value,
+        );
+    }
+
+    /**
+     * Restrict a query to running synchronization runs.
+     */
+    public function scopeRunning(Builder $query): Builder
+    {
+        return $query->where(
+            'status',
+            FacebookSyncStatus::RUNNING->value,
+        );
+    }
+
+    /**
+     * Restrict a query to active synchronization runs.
+     */
+    public function scopeActive(Builder $query): Builder
+    {
+        return $query->whereIn(
+            'status',
+            [
+                FacebookSyncStatus::QUEUED->value,
+                FacebookSyncStatus::RUNNING->value,
+            ],
+        );
+    }
+
+    /**
+     * Restrict a query to terminal synchronization runs.
+     */
+    public function scopeTerminal(Builder $query): Builder
+    {
+        return $query->whereIn(
+            'status',
+            [
+                FacebookSyncStatus::COMPLETED->value,
+                FacebookSyncStatus::FAILED->value,
+            ],
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Status Helpers
+    |--------------------------------------------------------------------------
+    */
+
     public function isQueued(): bool
     {
         return $this->status === FacebookSyncStatus::QUEUED;
     }
 
-    /**
-     * Determine whether the synchronization is currently running.
-     */
     public function isRunning(): bool
     {
         return $this->status === FacebookSyncStatus::RUNNING;
     }
 
-    /**
-     * Determine whether the synchronization completed successfully.
-     */
     public function isCompleted(): bool
     {
         return $this->status === FacebookSyncStatus::COMPLETED;
     }
 
-    /**
-     * Determine whether the synchronization failed.
-     */
     public function isFailed(): bool
     {
         return $this->status === FacebookSyncStatus::FAILED;
     }
 
-    /**
-     * Determine whether the synchronization is in an active state.
-     *
-     * Active states:
-     * - queued
-     * - running
-     */
     public function isActive(): bool
     {
-        return in_array(
-            $this->status,
-            [
-                FacebookSyncStatus::QUEUED,
-                FacebookSyncStatus::RUNNING,
-            ],
-            true,
-        );
+        return $this->isQueued() || $this->isRunning();
     }
 
-    /**
-     * Determine whether the synchronization reached a terminal state.
-     *
-     * Terminal states:
-     * - completed
-     * - failed
-     */
     public function isTerminal(): bool
     {
-        return in_array(
-            $this->status,
-            [
-                FacebookSyncStatus::COMPLETED,
-                FacebookSyncStatus::FAILED,
-            ],
-            true,
-        );
+        return $this->isCompleted() || $this->isFailed();
     }
 
     /**
-     * Determine whether the synchronization is finished.
-     *
      * Alias for isTerminal().
      */
     public function isFinished(): bool
@@ -273,13 +265,13 @@ class FacebookSyncRun extends Model
     |--------------------------------------------------------------------------
     */
 
-   /**
-     * Get synchronization duration in seconds.
+    /**
+     * Return the synchronization duration in seconds.
      *
-     * Returns:
-     * - null when the synchronization has not started yet.
-     * - elapsed seconds while running.
-     * - total duration after completion/failure.
+     * Returns null if execution has not started.
+     *
+     * Uses finished_at for terminal runs and the current time
+     * for runs that are still executing.
      */
     public function durationSeconds(): ?int
     {
@@ -287,104 +279,177 @@ class FacebookSyncRun extends Model
             return null;
         }
 
-        $end = $this->completed_at ?? now();
+        $end = $this->finished_at ?? now();
 
         return max(
             0,
             (int) $this->started_at->diffInSeconds($end),
         );
     }
-   
 
     /*
     |--------------------------------------------------------------------------
-    | State Transitions
+    | Lifecycle Management
     |--------------------------------------------------------------------------
+    |
+    | These methods update the synchronization lifecycle.
+    | They do not dispatch jobs, manage distributed locks, or guarantee
+    | that only one synchronization can run for a Facebook Page.
+    |
     */
 
     /**
      * Mark the synchronization run as running.
      *
-     * This method increments the attempt counter.
+     * Preserves the first start timestamp across retries.
+     * Increments attempts atomically in the database.
      */
     public function markAsRunning(): void
     {
+        $this->assertNotFinished();
+
+        $now = now();
+
+        $this->newQuery()
+            ->whereKey($this->getKey())
+            ->increment('attempts');
+
         $this->forceFill([
             'status' => FacebookSyncStatus::RUNNING,
 
-            'started_at' => now(),
+            'started_at' => $this->started_at ?? $now,
 
-            'attempts' => $this->attempts + 1,
+            'last_heartbeat_at' => $now,
+
+            'completed_at' => null,
+
+            'finished_at' => null,
+
+            'error_message' => null,
+        ])->save();
+
+        $this->refresh();
+    }
+
+    /**
+     * Update the last execution heartbeat.
+     *
+     * Call periodically during long-running synchronization work.
+     */
+    public function recordHeartbeat(): void
+    {
+        if (!$this->isRunning()) {
+            throw new \LogicException(
+                'A heartbeat can only be recorded for a running synchronization.',
+            );
+        }
+
+        $now = now();
+
+        $this->forceFill([
+            'last_heartbeat_at' => $now,
         ])->save();
     }
 
     /**
-     * Mark the synchronization run as completed.
+     * Mark the synchronization as successfully completed.
+     *
+     * This represents synchronization completion, not necessarily
+     * completion of all downstream AI processing.
      */
     public function markAsCompleted(): void
     {
+        if (!$this->isRunning()) {
+            throw new \LogicException(
+                'Only a running synchronization can be completed.',
+            );
+        }
+
+        $now = now();
+
         $this->forceFill([
             'status' => FacebookSyncStatus::COMPLETED,
 
-            'completed_at' => now(),
+            'completed_at' => $now,
+
+            'finished_at' => $now,
+
+            'last_heartbeat_at' => $now,
 
             'error_message' => null,
         ])->save();
     }
 
     /**
-     * Mark the synchronization run as failed.
+     * Mark the synchronization as permanently failed.
+     *
+     * Call this when the job reaches its terminal failure condition,
+     * not for an intermediate attempt that Laravel will retry.
      */
     public function markAsFailed(
         ?string $errorMessage = null,
     ): void {
+        $this->assertNotFinished();
+
+        $now = now();
+
         $this->forceFill([
             'status' => FacebookSyncStatus::FAILED,
 
-            'completed_at' => now(),
+            'completed_at' => null,
+
+            'finished_at' => $now,
+
+            'last_heartbeat_at' => $now,
 
             'error_message' => $errorMessage,
         ])->save();
     }
 
+    /**
+     * Prevent ordinary lifecycle methods from reopening a terminal run.
+     */
+    private function assertNotFinished(): void
+    {
+        if ($this->isTerminal()) {
+            throw new \LogicException(
+                'A terminal synchronization run cannot be restarted.',
+            );
+        }
+    }
+
     /*
     |--------------------------------------------------------------------------
-    | Counter Helpers
+    | Post Statistics
     |--------------------------------------------------------------------------
     */
 
     /**
-     * Increment post synchronization statistics.
+     * Atomically increment post synchronization counters.
+     *
+     * Counters represent the totals reported by the synchronization
+     * service. Callers must avoid reporting the same results twice.
      */
     public function incrementPostStatistics(
         int $fetched = 0,
         int $created = 0,
         int $updated = 0,
     ): void {
-        if ($fetched > 0) {
-            $this->increment(
-                'posts_fetched',
-                $fetched,
-            );
-        }
-
-        if ($created > 0) {
-            $this->increment(
-                'posts_created',
-                $created,
-            );
-        }
-
-        if ($updated > 0) {
-            $this->increment(
-                'posts_updated',
-                $updated,
-            );
-        }
+        $this->incrementCounters([
+            'posts_fetched' => $fetched,
+            'posts_created' => $created,
+            'posts_updated' => $updated,
+        ]);
     }
 
+    /*
+    |--------------------------------------------------------------------------
+    | Comment Statistics
+    |--------------------------------------------------------------------------
+    */
+
     /**
-     * Increment comment synchronization statistics.
+     * Atomically increment comment synchronization counters.
      */
     public function incrementCommentStatistics(
         int $fetched = 0,
@@ -392,37 +457,28 @@ class FacebookSyncRun extends Model
         int $updated = 0,
         int $failed = 0,
     ): void {
-        if ($fetched > 0) {
-            $this->increment(
-                'comments_fetched',
-                $fetched,
-            );
-        }
-
-        if ($created > 0) {
-            $this->increment(
-                'comments_created',
-                $created,
-            );
-        }
-
-        if ($updated > 0) {
-            $this->increment(
-                'comments_updated',
-                $updated,
-            );
-        }
-
-        if ($failed > 0) {
-            $this->increment(
-                'comments_failed',
-                $failed,
-            );
-        }
+        $this->incrementCounters([
+            'comments_fetched' => $fetched,
+            'comments_created' => $created,
+            'comments_updated' => $updated,
+            'comments_failed' => $failed,
+        ]);
     }
 
+    /*
+    |--------------------------------------------------------------------------
+    | AI Statistics
+    |--------------------------------------------------------------------------
+    */
+
     /**
-     * Increment AI statistics.
+     * Atomically increment AI dispatch and outcome counters.
+     *
+     * completed and failed should represent final task outcomes,
+     * not intermediate queue attempts.
+     *
+     * This method does not guarantee idempotency across repeated
+     * delivery of the same AI job. The caller must enforce that.
      */
     public function incrementAiStatistics(
         int $postsQueued = 0,
@@ -430,32 +486,103 @@ class FacebookSyncRun extends Model
         int $completed = 0,
         int $failed = 0,
     ): void {
-        if ($postsQueued > 0) {
-            $this->increment(
-                'posts_queued_for_ai',
-                $postsQueued,
+        $this->incrementCounters([
+            'posts_queued_for_ai' => $postsQueued,
+            'comments_queued_for_ai' => $commentsQueued,
+            'ai_completed' => $completed,
+            'ai_failed' => $failed,
+        ]);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Atomic Counter Updates
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * Increment a controlled set of counters atomically.
+     *
+     * Column names are supplied only by the internal methods above.
+     * Negative increments are rejected.
+     *
+     * Refreshes the current model so its attributes reflect database
+     * updates made by this method.
+     *
+     * Atomic increments prevent lost updates, but do not prevent
+     * duplicate counting if a job reports the same result twice.
+     *
+     * @param array<string, int> $counters
+     */
+    private function incrementCounters(array $counters): void
+    {
+        $updates = [];
+
+        foreach ($counters as $column => $amount) {
+            if ($amount < 0) {
+                throw new InvalidArgumentException(
+                    "Counter increments cannot be negative: {$column}.",
+                );
+            }
+
+            if ($amount === 0) {
+                continue;
+            }
+
+            $updates[$column] = $this->rawCounterExpression(
+                $column,
+                $amount,
             );
         }
 
-        if ($commentsQueued > 0) {
-            $this->increment(
-                'comments_queued_for_ai',
-                $commentsQueued,
+        if ($updates === []) {
+            return;
+        }
+
+        $updated = $this->newQuery()
+            ->whereKey($this->getKey())
+            ->update($updates);
+
+        if ($updated === 0) {
+            throw new \RuntimeException(
+                'The synchronization run no longer exists.',
             );
         }
 
-        if ($completed > 0) {
-            $this->increment(
-                'ai_completed',
-                $completed,
+        $this->refresh();
+    }
+
+    /**
+     * Build an arithmetic expression for an internally controlled counter.
+     *
+     * @return \Illuminate\Database\Query\Expression
+     */
+    private function rawCounterExpression(
+        string $column,
+        int $amount,
+    ): \Illuminate\Database\Query\Expression {
+        $allowedColumns = [
+            'posts_fetched',
+            'posts_created',
+            'posts_updated',
+            'comments_fetched',
+            'comments_created',
+            'comments_updated',
+            'comments_failed',
+            'posts_queued_for_ai',
+            'comments_queued_for_ai',
+            'ai_completed',
+            'ai_failed',
+        ];
+
+        if (!in_array($column, $allowedColumns, true)) {
+            throw new InvalidArgumentException(
+                "Unsupported synchronization counter: {$column}.",
             );
         }
 
-        if ($failed > 0) {
-            $this->increment(
-                'ai_failed',
-                $failed,
-            );
-        }
+        return \Illuminate\Support\Facades\DB::raw(
+            "{$column} + {$amount}",
+        );
     }
 }
