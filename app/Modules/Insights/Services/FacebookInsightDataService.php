@@ -2,169 +2,161 @@
 
 namespace App\Modules\Insights\Services;
 
+use App\Models\FacebookComment;
+use App\Models\FacebookPost;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Validation\ValidationException;
+
 class FacebookInsightDataService
 {
+    private const CHUNK_SIZE = 500;
+
+    private const SAMPLE_SIZE = 10;
+
     /**
-     * Collect randomized mock Facebook insight data.
+     * Collect real Facebook post comment and sentiment evidence.
      *
-     * TESTING ONLY: No database queries are executed.
-     * Mock metrics are generated consistently per post ID.
+     * The supplied post ID must identify the local FacebookPost
+     * database record, not the external Meta post ID.
+     *
+     * Comments are filtered by commented_at, inclusively by date.
+     * A comment is considered analyzed when its latest persisted
+     * sentiment analysis exists.
+     *
+     * No mock data or AI inference is performed here.
      */
     public function collect(
         string $postId,
         ?string $dateFrom = null,
         ?string $dateTo = null,
     ): array {
-        $commentPool = [
-            'The municipality is doing good work by improving our roads.',
-            'Garbage has not been collected regularly in our neighborhood.',
-            'Please install streetlights along the road near our residential area.',
-            'The new road has reduced travel time for many residents.',
-            'The drainage channels need cleaning before the rainy season.',
-            'We need a permanent solution for the recurring water shortage.',
-            'Please provide updates about construction projects in our area.',
-            'The streets around the market need better waste management.',
-            'We appreciate the effort to improve roads in our neighborhood.',
-            'Some roads are still difficult to use during heavy rainfall.',
-            'Public toilets around busy markets need improvement.',
-            'Streetlights are not working in several locations.',
-            'We appreciate efforts to keep public spaces clean.',
-            'Please repair damaged sidewalks to make walking safer.',
-            'Water supply interruptions are affecting local businesses.',
-            'Construction materials have been left on the road for days.',
-            'The city looks cleaner when waste is collected on time.',
-            'Residents need clear information about municipal service schedules.',
-            'Floodwater is accumulating because drainage channels are blocked.',
-            'Please give attention to roads in the outskirts of the city.',
-            'Public transport access would improve with completed road repairs.',
-            'The municipality should respond faster to residents’ complaints.',
-            'The new public infrastructure is a positive change for our city.',
-            'Please improve lighting around schools and public gathering places.',
-            'Road construction and drainage work need better coordination.',
-            'Water is available only for a few hours in our neighborhood.',
-            'The road project has been delayed without a public explanation.',
-            'Thank you for responding quickly to our service request.',
-            'Market waste is creating an unpleasant smell for nearby residents.',
-            'The municipality should publish its project completion dates.',
-            'The road repairs are useful, but some sections remain unfinished.',
-            'We need better waste collection services in residential areas.',
-            'The new drainage system has reduced flooding in our street.',
-            'Please improve access to clean water for all neighborhoods.',
-            'Public service offices need to respond to requests more efficiently.',
-            'The street near the school becomes dangerous at night.',
-            'Road maintenance should include smaller streets, not only main roads.',
-            'We are happy with the recent improvements to our neighborhood.',
-            'Water shortages are affecting schools and health facilities.',
-            'Please explain how residents can report municipal service problems.',
-        ];
+        $this->validateDateRange($dateFrom, $dateTo);
 
-        // Stable random selection per post ID for repeatable testing.
-        $seed = (int) sprintf('%u', crc32($postId));
-        mt_srand($seed);
+        $post = FacebookPost::query()
+            ->find($postId);
 
-        $totalComments = mt_rand(80, 250);
-        $analyzedComments = mt_rand(
-            (int) ceil($totalComments * 0.65),
-            $totalComments
-        );
-
-        $sampleSize = min(
-            count($commentPool),
-            $analyzedComments
-        );
-
-        $indexes = array_keys($commentPool);
-        shuffle($indexes);
-
-        $sampleComments = [];
-
-        foreach (array_slice($indexes, 0, $sampleSize) as $index) {
-            $sampleComments[] = $commentPool[$index];
+        if (! $post) {
+            throw ValidationException::withMessages([
+                'postId' => [
+                    'The specified Facebook post was not found.',
+                ],
+            ]);
         }
 
-        $positive = mt_rand(15, 65);
-        $neutral = mt_rand(10, 45);
-        $negative = 100 - $positive - $neutral;
+        $commentsQuery = $this->commentsQuery(
+            postId: (string) $post->getKey(),
+            dateFrom: $dateFrom,
+            dateTo: $dateTo,
+        );
 
-        // Ensure all three sentiment categories remain valid.
-        if ($negative < 5) {
-            $negative = 5;
-            $positive = mt_rand(15, 65);
-            $neutral = 100 - $positive - $negative;
-        }
+        $totalComments = (clone $commentsQuery)->count();
 
         $sentimentCounts = [
-            'positive' => (int) round(
-                $analyzedComments * $positive / 100
-            ),
-            'neutral' => (int) round(
-                $analyzedComments * $neutral / 100
-            ),
+            'positive' => 0,
+            'neutral' => 0,
             'negative' => 0,
+            'unknown' => 0,
         ];
 
-        // Adjust the last category so counts sum exactly.
-        $sentimentCounts['negative'] = max(
-            0,
-            $analyzedComments
-                - $sentimentCounts['positive']
-                - $sentimentCounts['neutral']
+        $topicCounts = [];
+        $languageCounts = [];
+
+        $analyzedComments = 0;
+
+        /*
+         * Process comments in chunks to avoid loading every comment
+         * and its sentiment analysis into memory at once.
+         */
+        (clone $commentsQuery)
+            ->with('latestSentimentAnalysis')
+            ->chunk(
+                self::CHUNK_SIZE,
+                function ($comments) use (
+                    &$sentimentCounts,
+                    &$topicCounts,
+                    &$languageCounts,
+                    &$analyzedComments,
+                ): void {
+                    foreach ($comments as $comment) {
+                        $analysis = $comment->latestSentimentAnalysis;
+
+                        if (! $analysis) {
+                            continue;
+                        }
+
+                        $analyzedComments++;
+
+                        /*
+                         * Count only labels that are actually stored.
+                         * Unknown or missing labels remain visible
+                         * rather than being silently assigned a class.
+                         */
+                        $sentiment = $this->normalizeLabel(
+                            $analysis->sentiment,
+                        );
+
+                        if (
+                            $sentiment !== null
+                            && array_key_exists(
+                                $sentiment,
+                                $sentimentCounts,
+                            )
+                        ) {
+                            $sentimentCounts[$sentiment]++;
+                        } else {
+                            $sentimentCounts['unknown']++;
+                        }
+
+                        $topic = $this->normalizeLabel(
+                            $analysis->topic,
+                        );
+
+                        $topic = $topic ?? 'unclassified';
+
+                        $topicCounts[$topic] =
+                            ($topicCounts[$topic] ?? 0) + 1;
+
+                        $language = $this->normalizeLabel(
+                            $analysis->language,
+                        );
+
+                        $language = $language ?? 'unknown';
+
+                        $languageCounts[$language] =
+                            ($languageCounts[$language] ?? 0) + 1;
+                    }
+                },
+            );
+
+        /*
+         * Percentages use analyzed comments as their denominator.
+         * Missing sentiment labels are represented by "unknown".
+         */
+        $sentimentPercentages = $this->calculatePercentages(
+            $sentimentCounts,
         );
 
-        $classifiedTotal = array_sum($sentimentCounts);
+        $topicDistribution = $this->calculatePercentages(
+            $topicCounts,
+        );
 
-        $sentimentPercentages = [];
+        $languageDistribution = $this->calculatePercentages(
+            $languageCounts,
+        );
 
-        foreach ($sentimentCounts as $sentiment => $count) {
-            $sentimentPercentages[$sentiment] = $classifiedTotal > 0
-                ? round(($count / $classifiedTotal) * 100, 2)
-                : 0;
-        }
-
-        $topics = [
-            'roads_infrastructure',
-            'waste_management',
-            'water',
-            'street_lighting',
-            'drainage_and_flooding',
-            'other',
-        ];
-
-        $topicWeights = [];
-
-        foreach ($topics as $topic) {
-            $topicWeights[$topic] = mt_rand(5, 35);
-        }
-
-        $topicTotal = array_sum($topicWeights);
-
-        $topicDistribution = [];
-
-        foreach ($topicWeights as $topic => $weight) {
-            $topicDistribution[$topic] = round(
-                ($weight / $topicTotal) * 100,
-                2
-            );
-        }
-
-        $languages = [
-            'am' => mt_rand(35, 65),
-            'om' => mt_rand(20, 45),
-            'en' => mt_rand(5, 20),
-        ];
-
-        $languageTotal = array_sum($languages);
-        $languageDistribution = [];
-
-        foreach ($languages as $language => $weight) {
-            $languageDistribution[$language] = round(
-                ($weight / $languageTotal) * 100,
-                2
-            );
-        }
+        /*
+         * Return actual comments that have a persisted analysis.
+         * Samples are the most recently commented analyzed comments
+         * within the requested date range.
+         */
+        $sampleComments = $this->getSampleComments(
+            postId: (string) $post->getKey(),
+            dateFrom: $dateFrom,
+            dateTo: $dateTo,
+        );
 
         return [
-            'post_id' => $postId,
+            'post_id' => (string) $post->getKey(),
 
             'date_range' => [
                 'from' => $dateFrom,
@@ -176,7 +168,7 @@ class FacebookInsightDataService
                 'analyzed_comments' => $analyzedComments,
                 'unanalysed_comments' => max(
                     0,
-                    $totalComments - $analyzedComments
+                    $totalComments - $analyzedComments,
                 ),
                 'sentiment_distribution' => $sentimentCounts,
                 'sentiment_percentages' => $sentimentPercentages,
@@ -186,5 +178,152 @@ class FacebookInsightDataService
 
             'sample_comments' => $sampleComments,
         ];
+    }
+
+    /**
+     * Build a query for comments belonging to a local Facebook post.
+     *
+     * Date boundaries are inclusive. An omitted boundary is unbounded.
+     */
+    private function commentsQuery(
+        string $postId,
+        ?string $dateFrom,
+        ?string $dateTo,
+    ): Builder {
+        $query = FacebookComment::query()
+            ->where('facebook_post_id', $postId);
+
+        if ($dateFrom !== null) {
+            $query->whereDate('commented_at', '>=', $dateFrom);
+        }
+
+        if ($dateTo !== null) {
+            $query->whereDate('commented_at', '<=', $dateTo);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Retrieve actual analyzed comment text for the evidence sample.
+     */
+    private function getSampleComments(
+        string $postId,
+        ?string $dateFrom,
+        ?string $dateTo,
+    ): array {
+        return $this->commentsQuery(
+            postId: $postId,
+            dateFrom: $dateFrom,
+            dateTo: $dateTo,
+        )
+            ->whereHas('latestSentimentAnalysis')
+            ->with('latestSentimentAnalysis')
+            ->orderByDesc('commented_at')
+            ->orderByDesc('id')
+            ->limit(self::SAMPLE_SIZE)
+            ->get()
+            ->map(
+                static fn (FacebookComment $comment): string =>
+                    trim((string) $comment->message),
+            )
+            ->filter(
+                static fn (string $message): bool =>
+                    $message !== '',
+            )
+            ->values()
+            ->all();
+    }
+
+    /**
+     * Convert counts into percentages.
+     *
+     * Percentages are rounded to two decimal places.
+     */
+    private function calculatePercentages(array $counts): array
+    {
+        $total = array_sum($counts);
+
+        $percentages = [];
+
+        foreach ($counts as $label => $count) {
+            $percentages[$label] = $total > 0
+                ? round(($count / $total) * 100, 2)
+                : 0.0;
+        }
+
+        return $percentages;
+    }
+
+    /**
+     * Normalize persisted category labels.
+     */
+    private function normalizeLabel(mixed $value): ?string
+    {
+        if (! is_string($value)) {
+            return null;
+        }
+
+        $value = mb_strtolower(trim($value));
+
+        return $value !== '' ? $value : null;
+    }
+
+    /**
+     * Validate date syntax and ensure the range is chronological.
+     *
+     * The request validator should also validate these parameters.
+     */
+    private function validateDateRange(
+        ?string $dateFrom,
+        ?string $dateTo,
+    ): void {
+        foreach ([
+            'dateFrom' => $dateFrom,
+            'dateTo' => $dateTo,
+        ] as $field => $value) {
+            if ($value === null || trim($value) === '') {
+                continue;
+            }
+
+            $date = \DateTimeImmutable::createFromFormat(
+                '!Y-m-d',
+                $value,
+            );
+
+            $errors = \DateTimeImmutable::getLastErrors();
+
+            if (
+                $date === false
+                || (
+                    $errors !== false
+                    && (
+                        $errors['warning_count'] > 0
+                        || $errors['error_count'] > 0
+                    )
+                )
+                || $date->format('Y-m-d') !== $value
+            ) {
+                throw ValidationException::withMessages([
+                    $field => [
+                        'The date must use the YYYY-MM-DD format.',
+                    ],
+                ]);
+            }
+        }
+
+        if (
+            $dateFrom !== null
+            && trim($dateFrom) !== ''
+            && $dateTo !== null
+            && trim($dateTo) !== ''
+            && $dateFrom > $dateTo
+        ) {
+            throw ValidationException::withMessages([
+                'dateTo' => [
+                    'The end date must be on or after the start date.',
+                ],
+            ]);
+        }
     }
 }

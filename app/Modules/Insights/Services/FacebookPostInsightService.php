@@ -1,14 +1,19 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Modules\Insights\Services;
 
 use App\Jobs\GeneratePostAiInsightJob;
 use App\Models\PostAiInsight;
 use App\Modules\Insights\Resources\FacebookPostInsightData;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
+use Throwable;
 
 class FacebookPostInsightService
 {
@@ -28,6 +33,11 @@ class FacebookPostInsightService
         ?string $requestedModel = null,
     ): FacebookPostInsightData {
         $this->validateLanguage($language);
+
+        [$dateFrom, $dateTo] = $this->normalizeDateRange(
+            $dateFrom,
+            $dateTo,
+        );
 
         $model = $this->resolveModel($requestedModel);
 
@@ -59,8 +69,16 @@ class FacebookPostInsightService
     /**
      * Queue insight generation for background processing.
      *
-     * Reuses the existing record for the same post and language.
-     * Completed insights are preserved unless regeneration is explicitly requested.
+     * Generation scope:
+     * - Facebook post ID
+     * - Language
+     * - Exact normalized date range
+     *
+     * Existing completed results are reused unless regeneration
+     * is explicitly requested.
+     *
+     * A matching request already in progress is never dispatched
+     * a second time by this method.
      */
     public function queueGeneration(
         string $postId,
@@ -72,97 +90,192 @@ class FacebookPostInsightService
     ): PostAiInsight {
         $this->validateLanguage($language);
 
-        $model = $this->resolveModel($requestedModel);
-
-        [$insight, $shouldDispatch] = DB::transaction(function () use (
-            $postId,
-            $language,
+        [$dateFrom, $dateTo] = $this->normalizeDateRange(
             $dateFrom,
             $dateTo,
-            $model,
-            $forceRegeneration,
-        ): array {
-            $record = PostAiInsight::query()
-                ->where('facebook_post_id', $postId)
-                ->where('language', $language)
-                ->lockForUpdate()
-                ->first();
+        );
 
-            // Never queue a second job while generation is already running.
-            if ($record && $record->isProcessing()) {
-                return [$record, false];
-            }
+        $model = $this->resolveModel($requestedModel);
 
-            // Preserve completed results unless regeneration was explicitly requested.
-            if (
-                $record
-                && $record->isCompleted()
-                && ! $forceRegeneration
-            ) {
-                return [$record, false];
-            }
+        /*
+         * Lock an existing matching row during the transaction.
+         *
+         * For concurrent first-time requests, the database should
+         * also enforce a unique generation-scope constraint.
+         */
+        [$insight, $shouldDispatch] = DB::transaction(
+            function () use (
+                $postId,
+                $language,
+                $dateFrom,
+                $dateTo,
+                $model,
+                $forceRegeneration,
+            ): array {
+                $query = PostAiInsight::query()
+                    ->where('facebook_post_id', $postId)
+                    ->where('language', $language);
 
-            // Reuse the existing record or create a new one.
-            if (! $record) {
-                $record = new PostAiInsight();
-                $record->facebook_post_id = $postId;
-                $record->language = $language;
-            }
+                $this->applyDateRangeIdentity(
+                    query: $query,
+                    dateFrom: $dateFrom,
+                    dateTo: $dateTo,
+                );
 
-            // An existing pending request should not create duplicate jobs
-            // unless regeneration was explicitly requested.
-            if (
-                $record->status === PostAiInsight::STATUS_PENDING
-                && ! $forceRegeneration
-            ) {
-                return [$record, false];
-            }
+                $record = $query
+                    ->lockForUpdate()
+                    ->first();
 
-            $metadata = is_array($record->metadata)
-                ? $record->metadata
-                : [];
+                /*
+                 * Never enqueue duplicate work for an active
+                 * generation, including forced requests.
+                 */
+                if ($record && $record->isProcessing()) {
+                    return [$record, false];
+                }
 
-            $metadata['generation_request'] = [
-                'date_from' => $dateFrom,
-                'date_to' => $dateTo,
-                'model' => $model,
-            ];
+                /*
+                 * Reuse completed content unless regeneration
+                 * was explicitly requested.
+                 */
+                if (
+                    $record
+                    && $record->isCompleted()
+                    && ! $forceRegeneration
+                ) {
+                    return [$record, false];
+                }
 
-            $record->metadata = $metadata;
-            $record->model_name = $model;
-            $record->status = PostAiInsight::STATUS_PENDING;
-            $record->error_message = null;
+                /*
+                 * A pending record is assumed to represent queued
+                 * work. A separate recovery process must detect
+                 * pending records whose jobs were never enqueued.
+                 */
+                if (
+                    $record
+                    && $record->status === PostAiInsight::STATUS_PENDING
+                    && ! $forceRegeneration
+                ) {
+                    return [$record, false];
+                }
 
-            // Keep previously generated content and generated_at until
-            // the replacement insight has been generated successfully.
-            $record->save();
+                /*
+                 * Reuse the existing record for this exact scope
+                 * or create a new record.
+                 */
+                if (! $record) {
+                    $record = new PostAiInsight();
 
-            return [$record, true];
-        });
+                    $record->facebook_post_id = $postId;
+                    $record->language = $language;
+                    $record->date_from = $dateFrom;
+                    $record->date_to = $dateTo;
+                }
 
-        if ($shouldDispatch) {
+                $metadata = is_array($record->metadata)
+                    ? $record->metadata
+                    : [];
+
+                $metadata['generation_request'] = [
+                    'date_from' => $dateFrom,
+                    'date_to' => $dateTo,
+                    'model' => $model,
+                    'requested_at' => now()->toIso8601String(),
+                    'force_regeneration' => $forceRegeneration,
+                ];
+
+                $record->date_from = $dateFrom;
+                $record->date_to = $dateTo;
+                $record->metadata = $metadata;
+                $record->model_name = $model;
+                $record->status = PostAiInsight::STATUS_PENDING;
+                $record->error_message = null;
+
+                /*
+                 * Preserve the previous generated content and
+                 * generated_at timestamp until the new generation
+                 * succeeds.
+                 */
+                $record->save();
+
+                return [$record, true];
+            },
+            attempts: 3,
+        );
+
+        if (! $shouldDispatch) {
+            return $insight;
+        }
+
+        /*
+         * Dispatch only after the database transaction has committed.
+         *
+         * If dispatch fails, mark this request as failed so it does
+         * not remain permanently pending. Log the failure and rethrow.
+         */
+        try {
             GeneratePostAiInsightJob::dispatch(
                 $insight->id,
                 $forceRegeneration,
             )->onQueue('insights');
+        } catch (Throwable $exception) {
+            Log::error(
+                'Failed to dispatch Facebook post insight generation job.',
+                [
+                    'insight_id' => $insight->id,
+                    'post_id' => $postId,
+                    'language' => $language,
+                    'date_from' => $dateFrom,
+                    'date_to' => $dateTo,
+                    'exception' => $exception::class,
+                    'message' => $exception->getMessage(),
+                ]
+            );
+
+            /*
+             * Do not overwrite a record that another worker has
+             * already started processing.
+             */
+            PostAiInsight::query()
+                ->whereKey($insight->id)
+                ->where('status', PostAiInsight::STATUS_PENDING)
+                ->update([
+                    'status' => PostAiInsight::STATUS_FAILED,
+                    'error_message' =>
+                        'The generation job could not be queued.',
+                    'updated_at' => now(),
+                ]);
+
+            throw new RuntimeException(
+                'Unable to queue Facebook post insight generation.',
+                previous: $exception,
+            );
         }
 
-        return $insight;
+        return $insight->fresh() ?? $insight;
     }
 
     /**
-     * Retrieve the latest completed insight for one Facebook post.
+     * Retrieve the latest completed insight for a Facebook post.
      *
-     * When language is null, return the most recently generated
-     * completed insight in any supported language.
+     * If both date boundaries are null, search across all date ranges.
+     * If either boundary is supplied, match the exact normalized range,
+     * including a null value for an unbounded boundary.
      */
     public function getLatestInsight(
         string $postId,
         ?string $language = null,
+        ?string $dateFrom = null,
+        ?string $dateTo = null,
     ): ?PostAiInsight {
         if ($language !== null) {
             $this->validateLanguage($language);
         }
+
+        [$dateFrom, $dateTo] = $this->normalizeDateRange(
+            $dateFrom,
+            $dateTo,
+        );
 
         $query = PostAiInsight::query()
             ->where('facebook_post_id', $postId)
@@ -172,78 +285,96 @@ class FacebookPostInsightService
             $query->where('language', $language);
         }
 
+        /*
+         * No dates means "latest across all ranges".
+         * A supplied boundary activates exact range matching.
+         */
+        if ($dateFrom !== null || $dateTo !== null) {
+            $this->applyDateRangeIdentity(
+                query: $query,
+                dateFrom: $dateFrom,
+                dateTo: $dateTo,
+            );
+        }
+
         return $query
             ->orderByDesc('generated_at')
             ->orderByDesc('updated_at')
+            ->orderByDesc('id')
             ->first();
     }
 
-    
-    
-/**
- * Paginate saved insights for the AI Insights page.
- *
- * Supported filters:
- * - language
- * - model
- * - post_id
- * - from
- * - to
- */
-public function paginateInsights(
-    array $filters = [],
-    int $perPage = 15,
-): LengthAwarePaginator {
-    if (!empty($filters['language'])) {
-        $this->validateLanguage($filters['language']);
+    /**
+     * Paginate saved insights for the AI Insights dashboard.
+     *
+     * Supported filters:
+     * - language
+     * - model
+     * - post_id
+     * - from
+     * - to
+     */
+    public function paginateInsights(
+        array $filters = [],
+        int $perPage = 15,
+    ): LengthAwarePaginator {
+        if (! empty($filters['language'])) {
+            $this->validateLanguage($filters['language']);
+        }
+
+        $perPage = max(1, min($perPage, 100));
+
+        $query = PostAiInsight::query()
+            ->with('facebookPost');
+
+        if (! empty($filters['language'])) {
+            $query->where('language', $filters['language']);
+        }
+
+        if (! empty($filters['model'])) {
+            $query->where('model_name', $filters['model']);
+        }
+
+        if (! empty($filters['post_id'])) {
+            $query->where(
+                'facebook_post_id',
+                $filters['post_id'],
+            );
+        }
+
+        /*
+         * These dashboard filters intentionally refer to the
+         * insight generation timestamp, not the comment date range.
+         */
+        if (! empty($filters['from'])) {
+            $query->whereDate(
+                'generated_at',
+                '>=',
+                $filters['from'],
+            );
+        }
+
+        if (! empty($filters['to'])) {
+            $query->whereDate(
+                'generated_at',
+                '<=',
+                $filters['to'],
+            );
+        }
+
+        return $query
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->paginate($perPage)
+            ->withQueryString();
     }
-
-    $perPage = max(1, min($perPage, 100));
-
-    $query = PostAiInsight::query()
-        ->with('facebookPost');
-
-    if (!empty($filters['language'])) {
-        $query->where('language', $filters['language']);
-    }
-
-    if (!empty($filters['model'])) {
-        $query->where('model_name', $filters['model']);
-    }
-
-    if (!empty($filters['post_id'])) {
-        $query->where(
-            'facebook_post_id',
-            $filters['post_id'],
-        );
-    }
-
-    if (!empty($filters['from'])) {
-        $query->whereDate(
-            'generated_at',
-            '>=',
-            $filters['from'],
-        );
-    }
-
-    if (!empty($filters['to'])) {
-        $query->whereDate(
-            'generated_at',
-            '<=',
-            $filters['to'],
-        );
-    }
-
-    return $query
-        ->orderByDesc('updated_at')
-        ->orderByDesc('id')
-        ->paginate($perPage)
-        ->withQueryString();
-}
-
 
     /**
-     * Collect and validate evidence for generation.
+     * Collect and validate database-backed evidence.
+     *
+     * This method does not perform AI inference.
+     *
+     * @return array<string, mixed>
      */
     private function collectAndValidateEvidence(
         string $postId,
@@ -271,6 +402,99 @@ public function paginateInsights(
         }
 
         return $evidence;
+    }
+
+    /**
+     * Normalize and validate the date range.
+     *
+     * Null means that boundary is unbounded. Partial ranges are
+     * supported, for example from=2026-10-01 and to=null.
+     *
+     * @return array{0: ?string, 1: ?string}
+     */
+    private function normalizeDateRange(
+        ?string $dateFrom,
+        ?string $dateTo,
+    ): array {
+        $dateFrom = $dateFrom !== null && trim($dateFrom) !== ''
+            ? trim($dateFrom)
+            : null;
+
+        $dateTo = $dateTo !== null && trim($dateTo) !== ''
+            ? trim($dateTo)
+            : null;
+
+        foreach ([
+            'dateFrom' => $dateFrom,
+            'dateTo' => $dateTo,
+        ] as $field => $date) {
+            if (
+                $date !== null
+                && (
+                    ! preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)
+                    || ! $this->isValidCalendarDate($date)
+                )
+            ) {
+                throw ValidationException::withMessages([
+                    $field === 'dateFrom'
+                        ? 'date_range.from'
+                        : 'date_range.to' => [
+                            'The date must be a valid date in YYYY-MM-DD format.',
+                        ],
+                ]);
+            }
+        }
+
+        if (
+            $dateFrom !== null
+            && $dateTo !== null
+            && $dateTo < $dateFrom
+        ) {
+            throw ValidationException::withMessages([
+                'date_range.to' => [
+                    'The end date must be on or after the start date.',
+                ],
+            ]);
+        }
+
+        return [$dateFrom, $dateTo];
+    }
+
+    /**
+     * Check that a date is a real calendar date.
+     */
+    private function isValidCalendarDate(string $date): bool
+    {
+        $parsed = \DateTimeImmutable::createFromFormat(
+            '!Y-m-d',
+            $date,
+        );
+
+        return $parsed !== false
+            && $parsed->format('Y-m-d') === $date;
+    }
+
+    /**
+     * Apply exact generation-scope date identity conditions.
+     *
+     * Null means that the stored boundary must also be null.
+     */
+    private function applyDateRangeIdentity(
+        Builder $query,
+        ?string $dateFrom,
+        ?string $dateTo,
+    ): void {
+        if ($dateFrom === null) {
+            $query->whereNull('date_from');
+        } else {
+            $query->whereDate('date_from', $dateFrom);
+        }
+
+        if ($dateTo === null) {
+            $query->whereNull('date_to');
+        } else {
+            $query->whereDate('date_to', $dateTo);
+        }
     }
 
     /**
@@ -309,6 +533,12 @@ public function paginateInsights(
             $allowedModels = [];
         }
 
+        $allowedModels = array_values(array_filter(
+            $allowedModels,
+            static fn (mixed $model): bool =>
+                is_string($model) && $model !== '',
+        ));
+
         $model = is_string($requestedModel)
             && trim($requestedModel) !== ''
                 ? trim($requestedModel)
@@ -316,7 +546,7 @@ public function paginateInsights(
 
         if (! is_string($model) || trim($model) === '') {
             throw new RuntimeException(
-                'The default Degertu AI model is not configured.'
+                'The default Degertu AI model is not configured.',
             );
         }
 
