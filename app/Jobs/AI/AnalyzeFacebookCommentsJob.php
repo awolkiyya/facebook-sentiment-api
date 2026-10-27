@@ -86,9 +86,9 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
         }
 
         /*
-         * Empty batches should not normally be dispatched. If one is
-         * received, account for it once so the pipeline cannot remain
-         * waiting for a job that has no work to perform.
+         * Empty batches should not normally be dispatched.
+         * Account for the pipeline job so the pipeline cannot wait
+         * indefinitely for a job that has no work to perform.
          */
         if ($commentIds === []) {
             Log::warning(
@@ -175,8 +175,9 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
          * AIOrchestrator remains responsible for inference, response
          * validation, model versioning, and sentiment persistence.
          *
-         * Do not increment the pipeline counter until analysis succeeds.
-         * If analysis throws, Laravel may retry this job.
+         * If analysis throws, Laravel may retry this job. Do not
+         * record a permanent failure here; failed() handles that
+         * after retries are exhausted.
          */
         try {
             $orchestrator->analyzeComments($comments);
@@ -197,9 +198,20 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
         }
 
         /*
-         * Record the successful batch once. A retry or duplicate execution
-         * with the same batch will not increment this counter again.
+         * Record API-facing AI statistics separately from pipeline
+         * counters. Idempotency prevents duplicate counting if the
+         * same batch is executed more than once.
+         *
+         * Record statistics before the pipeline completion counter,
+         * because the final pipeline counter may complete the run.
          */
+        $this->recordAiStatisticsOnce(
+            syncRunService: $syncRunService,
+            syncRunId: $syncRunId,
+            outcome: 'completed',
+            commentIds: $commentIds,
+        );
+
         $this->recordPipelineOutcomeOnce(
             syncRunService: $syncRunService,
             syncRunId: $syncRunId,
@@ -263,8 +275,8 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
         }
 
         /*
-         * Persist failure details separately from pipeline counters.
-         * Metadata failure must not prevent pipeline failure accounting.
+         * Persist failure details separately from counters.
+         * A metadata failure must not prevent pipeline accounting.
          */
         $this->recordFailureMetadata(
             syncRun: $syncRun,
@@ -274,7 +286,7 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
 
         if (! $this->isRunRunning($syncRun)) {
             Log::warning(
-                'Permanent comment AI failure was not added to pipeline counters because the sync run is no longer running.',
+                'Permanent comment AI failure was not added to statistics or pipeline counters because the sync run is no longer running.',
                 [
                     'sync_run_id' => (string) $syncRun->id,
                     'status' => $this->statusValue($syncRun),
@@ -289,6 +301,17 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
             /** @var FacebookSyncRunService $syncRunService */
             $syncRunService = app(FacebookSyncRunService::class);
 
+            /*
+             * Record the API-facing failure statistic before recording
+             * the pipeline counter, which may complete the run.
+             */
+            $this->recordAiStatisticsOnce(
+                syncRunService: $syncRunService,
+                syncRunId: (string) $syncRun->id,
+                outcome: 'failed',
+                commentIds: $commentIds,
+            );
+
             $this->recordPipelineOutcomeOnce(
                 syncRunService: $syncRunService,
                 syncRunId: (string) $syncRun->id,
@@ -301,7 +324,7 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
             );
         } catch (Throwable $pipelineException) {
             Log::critical(
-                'Failed to update the Facebook comment AI pipeline after permanent job failure.',
+                'Failed to update Facebook comment AI statistics or pipeline after permanent job failure.',
                 [
                     'sync_run_id' => (string) $syncRun->id,
                     'job_id' => $this->job?->getJobId(),
@@ -321,10 +344,49 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
     }
 
     /**
+     * Record API-facing AI statistics once per sync run, outcome, and batch.
+     *
+     * These statistics count AI batches, not individual comments.
+     *
+     * @param array<int, string> $commentIds
+     */
+    private function recordAiStatisticsOnce(
+        FacebookSyncRunService $syncRunService,
+        string $syncRunId,
+        string $outcome,
+        array $commentIds,
+    ): void {
+        if (! in_array($outcome, ['completed', 'failed'], true)) {
+            throw new AIException(
+                "Unsupported comment AI outcome '{$outcome}'.",
+            );
+        }
+
+        $canonicalIds = array_values(array_unique($commentIds));
+        sort($canonicalIds, SORT_STRING);
+
+        $operationKey = 'comment-ai-statistics:'
+            . $outcome
+            . ':'
+            . hash(
+                'sha256',
+                $syncRunId . '|' . implode('|', $canonicalIds),
+            );
+
+        $syncRunService->incrementStatisticsOnce(
+            runId: $syncRunId,
+            operationKey: $operationKey,
+            statistics: [
+                ($outcome === 'completed' ? 'ai_completed' : 'ai_failed') => 1,
+            ],
+        );
+    }
+
+    /**
      * Increment a pipeline outcome once for this sync run and batch.
      *
      * The operation key is deterministic for the run, outcome, and batch.
-     * This makes repeated accounting attempts idempotent.
+     * Repeated accounting attempts are idempotent.
      *
      * @param array<int, string> $commentIds
      */
@@ -344,7 +406,7 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
             ? 'comment_ai_jobs_completed'
             : 'comment_ai_jobs_failed';
 
-        $canonicalIds = $commentIds;
+        $canonicalIds = array_values(array_unique($commentIds));
         sort($canonicalIds, SORT_STRING);
 
         $operationKey = 'comment-ai:'
@@ -365,6 +427,8 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
     }
 
     /**
+     * Normalize and deduplicate comment IDs.
+     *
      * @param array<int, string> $commentIds
      * @return array<int, string>
      */
