@@ -11,9 +11,11 @@ use App\Modules\SyncRun\Resources\FacebookSyncRunDetailResource;
 use App\Modules\SyncRun\Resources\FacebookSyncRunResource;
 use App\Modules\SyncRun\Services\FacebookSyncRunService;
 use App\Services\ApiResponse;
+use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 use Throwable;
 
 final class FacebookSyncRunController extends Controller
@@ -23,172 +25,164 @@ final class FacebookSyncRunController extends Controller
     ) {
     }
 
-   
-/**
- * List Facebook synchronization runs.
- *
- * GET /api/v1/facebook/sync-runs
- *
- * Supported filters:
- * - facebook_page_id: Internal FacebookPage UUID
- * - status: Synchronization status
- * - trigger: Synchronization trigger
- * - type: Synchronization type
- */
-public function index(
-    ListFacebookSyncRunsRequest $request,
-): JsonResponse {
-    $requestId = $this->requestId($request);
-    $user = $request->user();
+    /**
+     * List Facebook synchronization runs.
+     *
+     * GET /api/v1/facebook/sync-runs
+     *
+     * SYSTEM_ADMIN:
+     *   Can view all synchronization runs.
+     *
+     * Other authenticated users:
+     *   Can view runs they triggered themselves.
+     *
+     * IMPORTANT:
+     * This is a conservative ownership rule. If users should see
+     * every run belonging to Pages they own or share, replace the
+     * triggeredByUser scope with your actual FacebookPage access
+     * relationship.
+     */
+    public function index(
+        ListFacebookSyncRunsRequest $request,
+    ): JsonResponse {
+        $requestId = $this->requestId($request);
+        $user = $request->user();
 
-    $validated = $request->validated();
+        $validated = $request->validated();
 
-    Log::info(
-        'Facebook sync runs list request started.',
-        [
-            'request_id' => $requestId,
-            'method' => $request->method(),
-            'path' => $request->path(),
-            'user_id' => $user?->getKey(),
-            'ip' => $request->ip(),
-            'filters' => [
-                'facebook_page_id' => $validated['facebook_page_id'] ?? null,
-                'status' => $validated['status'] ?? null,
-                'trigger' => $validated['trigger'] ?? null,
-                'type' => $validated['type'] ?? null,
-                'per_page' => $request->perPage(),
-                'page' => $request->pageNumber(),
-            ],
-        ],
-    );
-
-    try {
-        /*
-         * -------------------------------------------------------------
-         * Build query
-         * -------------------------------------------------------------
-         *
-         * Load the relationships defined on FacebookSyncRun:
-         * - facebookPage()
-         * - triggeredByUser()
-         */
-        $query = FacebookSyncRun::query()
-            ->with([
-                'facebookPage',
-                'triggeredByUser',
-            ])
-            ->latest('created_at');
-
-        /*
-         * -------------------------------------------------------------
-         * Facebook Page filter
-         * -------------------------------------------------------------
-         *
-         * facebook_page_id references facebook_pages.id, the internal
-         * Laravel UUID, not the external Meta Facebook Page ID.
-         */
-        if (! empty($validated['facebook_page_id'])) {
-            $query->where(
-                'facebook_page_id',
-                $validated['facebook_page_id'],
-            );
-        }
-
-        /*
-         * -------------------------------------------------------------
-         * Status filter
-         * -------------------------------------------------------------
-         */
-        if (! empty($validated['status'])) {
-            $query->where(
-                'status',
-                $validated['status'],
-            );
-        }
-
-        /*
-         * -------------------------------------------------------------
-         * Trigger filter
-         * -------------------------------------------------------------
-         */
-        if (! empty($validated['trigger'])) {
-            $query->where(
-                'trigger',
-                $validated['trigger'],
-            );
-        }
-
-        /*
-         * -------------------------------------------------------------
-         * Type filter
-         * -------------------------------------------------------------
-         */
-        if (! empty($validated['type'])) {
-            $query->where(
-                'type',
-                $validated['type'],
-            );
-        }
-
-        /*
-         * -------------------------------------------------------------
-         * Pagination
-         * -------------------------------------------------------------
-         */
-        $runs = $query->paginate(
-            perPage: $request->perPage(),
-            page: $request->pageNumber(),
-        );
-
-        /*
-         * -------------------------------------------------------------
-         * Logging
-         * -------------------------------------------------------------
-         */
         Log::info(
-            'Facebook sync runs list loaded successfully.',
+            'Facebook sync runs list request started.',
             [
                 'request_id' => $requestId,
-                'user_id' => $user?->getKey(),
-                'total' => $runs->total(),
-                'current_page' => $runs->currentPage(),
-                'per_page' => $runs->perPage(),
-                'last_page' => $runs->lastPage(),
-                'returned_count' => $runs->count(),
+                'method' => $request->method(),
+                'path' => $request->path(),
+                'user_id' => $user?->getAuthIdentifier(),
+                'ip' => $request->ip(),
+                'filters' => [
+                    'facebook_page_id' =>
+                        $validated['facebook_page_id'] ?? null,
+                    'status' => $validated['status'] ?? null,
+                    'trigger' => $validated['trigger'] ?? null,
+                    'type' => $validated['type'] ?? null,
+                    'per_page' => $request->perPage(),
+                    'page' => $request->pageNumber(),
+                ],
             ],
         );
 
-        /*
-         * -------------------------------------------------------------
-         * API response
-         * -------------------------------------------------------------
-         */
-        return ApiResponse::success(
-            data: FacebookSyncRunResource::collection($runs),
-            message: 'Facebook synchronization runs retrieved successfully.',
-        );
-    } catch (Throwable $exception) {
-        Log::error(
-            'Failed to load Facebook sync runs list.',
-            [
-                'request_id' => $requestId,
-                'user_id' => $user?->getKey(),
-                'exception_class' => $exception::class,
-                'exception_message' => $this->safeExceptionMessage(
-                    $exception,
-                ),
-            ],
-        );
+        try {
+            $this->requireAuthenticatedUser($user);
 
-        throw $exception;
+            $isSystemAdmin = $this->isSystemAdmin($user);
+
+            $query = FacebookSyncRun::query()
+                ->with([
+                    'facebookPage',
+                    'triggeredByUser',
+                ])
+                ->latest('created_at');
+
+            /*
+             * Authorization scope.
+             *
+             * Non-admin users cannot retrieve the global list.
+             * Scope the query before applying user-provided filters.
+             */
+            if (! $isSystemAdmin) {
+                $query->whereHas(
+                    'triggeredByUser',
+                    static function ($userQuery) use ($user): void {
+                        $userQuery->whereKey(
+                            $user->getAuthIdentifier(),
+                        );
+                    },
+                );
+            }
+
+            /*
+             * Optional Facebook Page filter.
+             *
+             * This is the internal FacebookPage UUID, not the
+             * external Meta Facebook Page ID.
+             *
+             * The filter narrows the authorized query; it does
+             * not grant additional access.
+             */
+            if (! empty($validated['facebook_page_id'])) {
+                $query->where(
+                    'facebook_page_id',
+                    $validated['facebook_page_id'],
+                );
+            }
+
+            if (! empty($validated['status'])) {
+                $query->where(
+                    'status',
+                    $validated['status'],
+                );
+            }
+
+            if (! empty($validated['trigger'])) {
+                $query->where(
+                    'trigger',
+                    $validated['trigger'],
+                );
+            }
+
+            if (! empty($validated['type'])) {
+                $query->where(
+                    'type',
+                    $validated['type'],
+                );
+            }
+
+            $runs = $query->paginate(
+                perPage: $request->perPage(),
+                page: $request->pageNumber(),
+            );
+
+            Log::info(
+                'Facebook sync runs list loaded successfully.',
+                [
+                    'request_id' => $requestId,
+                    'user_id' => $user->getAuthIdentifier(),
+                    'is_system_admin' => $isSystemAdmin,
+                    'total' => $runs->total(),
+                    'current_page' => $runs->currentPage(),
+                    'per_page' => $runs->perPage(),
+                    'last_page' => $runs->lastPage(),
+                    'returned_count' => $runs->count(),
+                ],
+            );
+
+            return ApiResponse::success(
+                data: FacebookSyncRunResource::collection($runs),
+                message: 'Facebook synchronization runs retrieved successfully.',
+            );
+        } catch (Throwable $exception) {
+            Log::error(
+                'Failed to load Facebook sync runs list.',
+                [
+                    'request_id' => $requestId,
+                    'user_id' => $user?->getAuthIdentifier(),
+                    'exception_class' => $exception::class,
+                    'exception_message' => $this->safeExceptionMessage(
+                        $exception,
+                    ),
+                ],
+            );
+
+            throw $exception;
+        }
     }
-}
-
 
     /**
      * Show a Facebook synchronization run.
      *
      * GET /api/v1/facebook/sync-runs/{id}
+     *
+     * SYSTEM_ADMIN can view any run.
+     * Other users can view only runs they triggered.
      */
     public function show(
         Request $request,
@@ -202,17 +196,13 @@ public function index(
             [
                 'request_id' => $requestId,
                 'sync_run_id' => $id,
-                'user_id' => $user?->getKey(),
+                'user_id' => $user?->getAuthIdentifier(),
                 'ip' => $request->ip(),
             ],
         );
 
         try {
-            /*
-             * -------------------------------------------------------------
-             * Validate ID
-             * -------------------------------------------------------------
-             */
+            $this->requireAuthenticatedUser($user);
 
             $syncRunId = trim($id);
 
@@ -222,12 +212,6 @@ public function index(
                 );
             }
 
-            /*
-             * -------------------------------------------------------------
-             * Load synchronization run
-             * -------------------------------------------------------------
-             */
-
             $run = FacebookSyncRun::query()
                 ->with([
                     'facebookPage',
@@ -236,32 +220,26 @@ public function index(
                 ->findOrFail($syncRunId);
 
             /*
-             * -------------------------------------------------------------
-             * Logging
-             * -------------------------------------------------------------
+             * Authorize the specific run after loading it.
+             * Never rely on possession of the run UUID.
              */
+            $this->authorizeRunAccess($user, $run);
 
             Log::info(
                 'Facebook sync run loaded successfully.',
                 [
                     'request_id' => $requestId,
                     'sync_run_id' => $run->getKey(),
-                    'user_id' => $user?->getKey(),
+                    'user_id' => $user->getAuthIdentifier(),
                     'facebook_page_id' => $run->facebook_page_id,
-                    'status' => $run->status->value,
-                    'type' => $run->type->value,
-                    'trigger' => $run->trigger->value,
+                    'status' => $this->enumValue($run->status),
+                    'type' => $this->enumValue($run->type),
+                    'trigger' => $this->enumValue($run->trigger),
                     'queue' => $run->queue,
                     'attempts' => $run->attempts,
                     'is_active' => $run->isActive(),
                 ],
             );
-
-            /*
-             * -------------------------------------------------------------
-             * API Response
-             * -------------------------------------------------------------
-             */
 
             return ApiResponse::success(
                 data: new FacebookSyncRunDetailResource($run),
@@ -273,7 +251,7 @@ public function index(
                 [
                     'request_id' => $requestId,
                     'sync_run_id' => $id,
-                    'user_id' => $user?->getKey(),
+                    'user_id' => $user?->getAuthIdentifier(),
                     'exception_class' => $exception::class,
                     'exception_message' => $this->safeExceptionMessage(
                         $exception,
@@ -289,6 +267,10 @@ public function index(
      * Retry a failed or cancelled synchronization run.
      *
      * POST /api/v1/facebook/sync-runs/{id}/retry
+     *
+     * Access to the run and permission to retry are separate concerns.
+     * This method enforces run access; the service must continue to
+     * validate retryable statuses and prevent duplicate active runs.
      */
     public function retry(
         Request $request,
@@ -302,17 +284,13 @@ public function index(
             [
                 'request_id' => $requestId,
                 'sync_run_id' => $id,
-                'user_id' => $user?->getKey(),
+                'user_id' => $user?->getAuthIdentifier(),
                 'ip' => $request->ip(),
             ],
         );
 
         try {
-            /*
-             * -------------------------------------------------------------
-             * Validate ID
-             * -------------------------------------------------------------
-             */
+            $this->requireAuthenticatedUser($user);
 
             $syncRunId = trim($id);
 
@@ -322,12 +300,6 @@ public function index(
                 );
             }
 
-            /*
-             * -------------------------------------------------------------
-             * Load run
-             * -------------------------------------------------------------
-             */
-
             $run = $this->syncRunService->find($syncRunId);
 
             $run->load([
@@ -335,19 +307,10 @@ public function index(
                 'triggeredByUser',
             ]);
 
-            /*
-             * -------------------------------------------------------------
-             * Retry
-             * -------------------------------------------------------------
-             *
-             * The service is responsible for:
-             *
-             * - validating the current status
-             * - preventing duplicate active synchronization
-             * - resetting/rebuilding required pipeline state
-             * - dispatching the appropriate synchronization job
-             * - returning the updated run
-             */
+            $this->authorizeRunAccess($user, $run);
+
+            $previousStatus = $this->enumValue($run->status);
+
             $retriedRun = $this->syncRunService->retry(
                 $run,
                 $user,
@@ -358,31 +321,21 @@ public function index(
                 'triggeredByUser',
             ]);
 
-            /*
-             * -------------------------------------------------------------
-             * Logging
-             * -------------------------------------------------------------
-             */
-
             Log::info(
                 'Facebook sync run retry queued successfully.',
                 [
                     'request_id' => $requestId,
                     'sync_run_id' => $retriedRun->getKey(),
-                    'user_id' => $user?->getKey(),
-                    'previous_status' => $run->status->value,
-                    'new_status' => $retriedRun->status->value,
+                    'user_id' => $user->getAuthIdentifier(),
+                    'previous_status' => $previousStatus,
+                    'new_status' => $this->enumValue(
+                        $retriedRun->status,
+                    ),
                     'queue' => $retriedRun->queue,
                     'job_id' => $retriedRun->job_id,
                     'attempts' => $retriedRun->attempts,
                 ],
             );
-
-            /*
-             * -------------------------------------------------------------
-             * API Response
-             * -------------------------------------------------------------
-             */
 
             return ApiResponse::success(
                 data: new FacebookSyncRunDetailResource($retriedRun),
@@ -394,7 +347,7 @@ public function index(
                 [
                     'request_id' => $requestId,
                     'sync_run_id' => $id,
-                    'user_id' => $user?->getKey(),
+                    'user_id' => $user?->getAuthIdentifier(),
                     'exception_class' => $exception::class,
                     'exception_message' => $this->safeExceptionMessage(
                         $exception,
@@ -410,6 +363,10 @@ public function index(
      * Cancel a queued or running synchronization run.
      *
      * DELETE /api/v1/facebook/sync-runs/{id}
+     *
+     * Access to the run and permission to cancel are separate concerns.
+     * The service must continue to validate cancellation state and
+     * safely stop further pipeline work.
      */
     public function destroy(
         Request $request,
@@ -423,17 +380,13 @@ public function index(
             [
                 'request_id' => $requestId,
                 'sync_run_id' => $id,
-                'user_id' => $user?->getKey(),
+                'user_id' => $user?->getAuthIdentifier(),
                 'ip' => $request->ip(),
             ],
         );
 
         try {
-            /*
-             * -------------------------------------------------------------
-             * Validate ID
-             * -------------------------------------------------------------
-             */
+            $this->requireAuthenticatedUser($user);
 
             $syncRunId = trim($id);
 
@@ -443,12 +396,6 @@ public function index(
                 );
             }
 
-            /*
-             * -------------------------------------------------------------
-             * Load run
-             * -------------------------------------------------------------
-             */
-
             $run = $this->syncRunService->find($syncRunId);
 
             $run->load([
@@ -456,18 +403,10 @@ public function index(
                 'triggeredByUser',
             ]);
 
-            /*
-             * -------------------------------------------------------------
-             * Cancel synchronization
-             * -------------------------------------------------------------
-             *
-             * The service is responsible for:
-             *
-             * - validating that the run is queued/running
-             * - marking the run as cancelled
-             * - preventing further pipeline work
-             * - handling cancellation safely for queued jobs
-             */
+            $this->authorizeRunAccess($user, $run);
+
+            $previousStatus = $this->enumValue($run->status);
+
             $cancelledRun = $this->syncRunService->cancel(
                 $run,
                 $user,
@@ -478,30 +417,20 @@ public function index(
                 'triggeredByUser',
             ]);
 
-            /*
-             * -------------------------------------------------------------
-             * Logging
-             * -------------------------------------------------------------
-             */
-
             Log::info(
                 'Facebook sync run cancelled successfully.',
                 [
                     'request_id' => $requestId,
                     'sync_run_id' => $cancelledRun->getKey(),
-                    'user_id' => $user?->getKey(),
-                    'previous_status' => $run->status->value,
-                    'new_status' => $cancelledRun->status->value,
+                    'user_id' => $user->getAuthIdentifier(),
+                    'previous_status' => $previousStatus,
+                    'new_status' => $this->enumValue(
+                        $cancelledRun->status,
+                    ),
                     'queue' => $cancelledRun->queue,
                     'job_id' => $cancelledRun->job_id,
                 ],
             );
-
-            /*
-             * -------------------------------------------------------------
-             * API Response
-             * -------------------------------------------------------------
-             */
 
             return ApiResponse::success(
                 data: new FacebookSyncRunDetailResource($cancelledRun),
@@ -513,7 +442,7 @@ public function index(
                 [
                     'request_id' => $requestId,
                     'sync_run_id' => $id,
-                    'user_id' => $user?->getKey(),
+                    'user_id' => $user?->getAuthIdentifier(),
                     'exception_class' => $exception::class,
                     'exception_message' => $this->safeExceptionMessage(
                         $exception,
@@ -523,6 +452,70 @@ public function index(
 
             throw $exception;
         }
+    }
+
+    /**
+     * Ensure a request has an authenticated user.
+     */
+    private function requireAuthenticatedUser(
+        ?Authenticatable $user,
+    ): void {
+        if ($user === null) {
+            abort(401, 'Authentication is required.');
+        }
+    }
+
+    /**
+     * Determine whether the user has the SYSTEM_ADMIN role.
+     *
+     * This uses Spatie's hasRole() method when available.
+     * Ensure the role's guard_name matches your application's
+     * configured Spatie guard.
+     */
+    private function isSystemAdmin(
+        ?Authenticatable $user,
+    ): bool {
+        if (
+            $user === null
+            || ! method_exists($user, 'hasRole')
+        ) {
+            return false;
+        }
+
+        return $user->hasRole('SYSTEM_ADMIN');
+    }
+
+    /**
+     * Authorize access to a specific synchronization run.
+     *
+     * SYSTEM_ADMIN can access every run.
+     * Other users can access only runs they triggered.
+     *
+     * The triggeredByUser relationship is used rather than assuming
+     * a database foreign-key column name.
+     */
+    private function authorizeRunAccess(
+        Authenticatable $user,
+        FacebookSyncRun $run,
+    ): void {
+        if ($this->isSystemAdmin($user)) {
+            return;
+        }
+
+        $triggeredByUser = $run->triggeredByUser;
+
+        if (
+            $triggeredByUser !== null
+            && (string) $triggeredByUser->getAuthIdentifier()
+                === (string) $user->getAuthIdentifier()
+        ) {
+            return;
+        }
+
+        abort(
+            403,
+            'You are not authorized to access this synchronization run.',
+        );
     }
 
     /**
@@ -543,6 +536,26 @@ public function index(
     }
 
     /**
+     * Convert an enum or scalar value to a log-safe string.
+     */
+    private function enumValue(mixed $value): ?string
+    {
+        if ($value instanceof \BackedEnum) {
+            return (string) $value->value;
+        }
+
+        if ($value instanceof \UnitEnum) {
+            return $value->name;
+        }
+
+        if (is_string($value) || is_numeric($value)) {
+            return (string) $value;
+        }
+
+        return null;
+    }
+
+    /**
      * Sanitize exception messages before logging them.
      */
     private function safeExceptionMessage(
@@ -555,7 +568,7 @@ public function index(
         }
 
         $message = preg_replace(
-            '/([?&](?:access_token|appsecret_proof)=)[^&\s]+/i',
+            '/([?&](?:access_token|appsecret_proof)=)[^&\s]*/i',
             '$1[REDACTED]',
             $message,
         ) ?? $message;
@@ -566,10 +579,12 @@ public function index(
             $message,
         ) ?? $message;
 
-        return mb_substr(
+        $message = preg_replace(
+            '/(Bearer\s+)[A-Za-z0-9._~+\/=-]+/i',
+            '$1[REDACTED]',
             $message,
-            0,
-            5000,
-        );
+        ) ?? $message;
+
+        return mb_substr($message, 0, 5000);
     }
 }
