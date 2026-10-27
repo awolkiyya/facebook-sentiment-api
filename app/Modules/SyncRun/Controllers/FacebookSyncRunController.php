@@ -23,172 +23,167 @@ final class FacebookSyncRunController extends Controller
     ) {
     }
 
-    /**
-     * List Facebook synchronization runs.
-     *
-     * GET /api/v1/facebook/sync-runs
-     *
-     * Supported filters:
-     * - facebook_page_id
-     * - status
-     * - trigger
-     * - type
-     */
-    public function index(
-        ListFacebookSyncRunsRequest $request,
-    ): JsonResponse {
-        $requestId = $this->requestId($request);
-        $user = $request->user();
+   
+/**
+ * List Facebook synchronization runs.
+ *
+ * GET /api/v1/facebook/sync-runs
+ *
+ * Supported filters:
+ * - facebook_page_id: Internal FacebookPage UUID
+ * - status: Synchronization status
+ * - trigger: Synchronization trigger
+ * - type: Synchronization type
+ */
+public function index(
+    ListFacebookSyncRunsRequest $request,
+): JsonResponse {
+    $requestId = $this->requestId($request);
+    $user = $request->user();
 
+    $validated = $request->validated();
+
+    Log::info(
+        'Facebook sync runs list request started.',
+        [
+            'request_id' => $requestId,
+            'method' => $request->method(),
+            'path' => $request->path(),
+            'user_id' => $user?->getKey(),
+            'ip' => $request->ip(),
+            'filters' => [
+                'facebook_page_id' => $validated['facebook_page_id'] ?? null,
+                'status' => $validated['status'] ?? null,
+                'trigger' => $validated['trigger'] ?? null,
+                'type' => $validated['type'] ?? null,
+                'per_page' => $request->perPage(),
+                'page' => $request->pageNumber(),
+            ],
+        ],
+    );
+
+    try {
+        /*
+         * -------------------------------------------------------------
+         * Build query
+         * -------------------------------------------------------------
+         *
+         * Load the relationships defined on FacebookSyncRun:
+         * - facebookPage()
+         * - triggeredByUser()
+         */
+        $query = FacebookSyncRun::query()
+            ->with([
+                'facebookPage',
+                'triggeredByUser',
+            ])
+            ->latest('created_at');
+
+        /*
+         * -------------------------------------------------------------
+         * Facebook Page filter
+         * -------------------------------------------------------------
+         *
+         * facebook_page_id references facebook_pages.id, the internal
+         * Laravel UUID, not the external Meta Facebook Page ID.
+         */
+        if (! empty($validated['facebook_page_id'])) {
+            $query->where(
+                'facebook_page_id',
+                $validated['facebook_page_id'],
+            );
+        }
+
+        /*
+         * -------------------------------------------------------------
+         * Status filter
+         * -------------------------------------------------------------
+         */
+        if (! empty($validated['status'])) {
+            $query->where(
+                'status',
+                $validated['status'],
+            );
+        }
+
+        /*
+         * -------------------------------------------------------------
+         * Trigger filter
+         * -------------------------------------------------------------
+         */
+        if (! empty($validated['trigger'])) {
+            $query->where(
+                'trigger',
+                $validated['trigger'],
+            );
+        }
+
+        /*
+         * -------------------------------------------------------------
+         * Type filter
+         * -------------------------------------------------------------
+         */
+        if (! empty($validated['type'])) {
+            $query->where(
+                'type',
+                $validated['type'],
+            );
+        }
+
+        /*
+         * -------------------------------------------------------------
+         * Pagination
+         * -------------------------------------------------------------
+         */
+        $runs = $query->paginate(
+            perPage: $request->perPage(),
+            page: $request->pageNumber(),
+        );
+
+        /*
+         * -------------------------------------------------------------
+         * Logging
+         * -------------------------------------------------------------
+         */
         Log::info(
-            'Facebook sync runs list request started.',
+            'Facebook sync runs list loaded successfully.',
             [
                 'request_id' => $requestId,
-                'method' => $request->method(),
-                'path' => $request->path(),
                 'user_id' => $user?->getKey(),
-                'ip' => $request->ip(),
-                'filters' => [
-                    'facebook_page_id' => $request->input(
-                        'facebook_page_id',
-                    ),
-                    'status' => $request->input('status'),
-                    'trigger' => $request->input('trigger'),
-                    'type' => $request->input('type'),
-                    'per_page' => $request->perPage(),
-                    'page' => $request->pageNumber(),
-                ],
+                'total' => $runs->total(),
+                'current_page' => $runs->currentPage(),
+                'per_page' => $runs->perPage(),
+                'last_page' => $runs->lastPage(),
+                'returned_count' => $runs->count(),
             ],
         );
 
-        try {
-            /*
-             * -------------------------------------------------------------
-             * Build query
-             * -------------------------------------------------------------
-             */
+        /*
+         * -------------------------------------------------------------
+         * API response
+         * -------------------------------------------------------------
+         */
+        return ApiResponse::success(
+            data: FacebookSyncRunResource::collection($runs),
+            message: 'Facebook synchronization runs retrieved successfully.',
+        );
+    } catch (Throwable $exception) {
+        Log::error(
+            'Failed to load Facebook sync runs list.',
+            [
+                'request_id' => $requestId,
+                'user_id' => $user?->getKey(),
+                'exception_class' => $exception::class,
+                'exception_message' => $this->safeExceptionMessage(
+                    $exception,
+                ),
+            ],
+        );
 
-            $query = FacebookSyncRun::query()
-                ->with([
-                    'facebookPage',
-                    'triggeredByUser',
-                ])
-                ->latest('created_at');
-
-            /*
-             * -------------------------------------------------------------
-             * Facebook Page filter
-             * -------------------------------------------------------------
-             *
-             * facebook_sync_runs.facebook_page_id contains the INTERNAL
-             * Laravel UUID from facebook_pages.id.
-             */
-            if ($request->filled('facebook_page_id')) {
-                $facebookPageId = (string) $request->input(
-                    'facebook_page_id',
-                );
-
-                $query->where(
-                    'facebook_page_id',
-                    $facebookPageId,
-                );
-            }
-
-            /*
-             * -------------------------------------------------------------
-             * Status filter
-             * -------------------------------------------------------------
-             */
-
-            if ($request->filled('status')) {
-                $query->where(
-                    'status',
-                    $request->input('status'),
-                );
-            }
-
-            /*
-             * -------------------------------------------------------------
-             * Trigger filter
-             * -------------------------------------------------------------
-             */
-
-            if ($request->filled('trigger')) {
-                $query->where(
-                    'trigger',
-                    $request->input('trigger'),
-                );
-            }
-
-            /*
-             * -------------------------------------------------------------
-             * Type filter
-             * -------------------------------------------------------------
-             */
-
-            if ($request->filled('type')) {
-                $query->where(
-                    'type',
-                    $request->input('type'),
-                );
-            }
-
-            /*
-             * -------------------------------------------------------------
-             * Pagination
-             * -------------------------------------------------------------
-             */
-
-            $runs = $query->paginate(
-                perPage: $request->perPage(),
-                page: $request->pageNumber(),
-            );
-
-            /*
-             * -------------------------------------------------------------
-             * Logging
-             * -------------------------------------------------------------
-             */
-
-            Log::info(
-                'Facebook sync runs list loaded successfully.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user?->getKey(),
-                    'total' => $runs->total(),
-                    'current_page' => $runs->currentPage(),
-                    'per_page' => $runs->perPage(),
-                    'last_page' => $runs->lastPage(),
-                    'returned_count' => $runs->count(),
-                ],
-            );
-
-            /*
-             * -------------------------------------------------------------
-             * API Response
-             * -------------------------------------------------------------
-             */
-
-            return ApiResponse::success(
-                data: FacebookSyncRunResource::collection($runs),
-                message: 'Facebook synchronization runs retrieved successfully.',
-            );
-        } catch (Throwable $exception) {
-            Log::error(
-                'Failed to load Facebook sync runs list.',
-                [
-                    'request_id' => $requestId,
-                    'user_id' => $user?->getKey(),
-                    'exception_class' => $exception::class,
-                    'exception_message' => $this->safeExceptionMessage(
-                        $exception,
-                    ),
-                ],
-            );
-
-            throw $exception;
-        }
+        throw $exception;
     }
+}
+
 
     /**
      * Show a Facebook synchronization run.

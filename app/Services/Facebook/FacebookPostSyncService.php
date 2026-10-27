@@ -21,9 +21,19 @@ final class FacebookPostSyncService
     ) {}
 
     /**
-     * Synchronize posts and return local post UUIDs requiring comment sync.
+     * Synchronize Facebook posts and report synchronization statistics.
      *
-     * @return array<int, string>
+     * @return array{
+     *     post_ids: array<int, string>,
+     *     statistics: array{
+     *         posts_fetched: int,
+     *         posts_created: int,
+     *         posts_updated: int
+     *     },
+     *     pages_processed: int,
+     *     bounded_completion: bool,
+     *     last_synced_at_updated: bool
+     * }
      */
     public function sync(FacebookPage $page): array
     {
@@ -32,13 +42,16 @@ final class FacebookPostSyncService
         $accessToken = $this->resolveAccessToken($page);
 
         $nextUrl = $this->graphApi->buildPostsUrl(
-            (string) $page->facebook_page_id
+            (string) $page->facebook_page_id,
         );
 
         $visitedUrls = [];
         $commentSyncIds = [];
+
         $pageCount = 0;
         $postCount = 0;
+        $postsCreated = 0;
+        $postsUpdated = 0;
         $bounded = false;
 
         Log::info('Facebook post synchronization started.', [
@@ -61,16 +74,16 @@ final class FacebookPostSyncService
                 }
 
                 $requestUrl = $this->graphApi->preparePaginationUrl(
-                    $nextUrl
+                    $nextUrl,
                 );
 
                 $fingerprint = $this->graphApi->paginationFingerprint(
-                    $requestUrl
+                    $requestUrl,
                 );
 
                 if (isset($visitedUrls[$fingerprint])) {
                     throw new RuntimeException(
-                        'Meta returned a repeated pagination URL.'
+                        'Meta returned a repeated pagination URL.',
                     );
                 }
 
@@ -105,6 +118,12 @@ final class FacebookPostSyncService
 
                     $postCount++;
 
+                    if ($persisted['created']) {
+                        $postsCreated++;
+                    } elseif ($persisted['changed']) {
+                        $postsUpdated++;
+                    }
+
                     if ($persisted['requires_comment_sync']) {
                         $localId = (string) $persisted['post']->id;
 
@@ -118,31 +137,46 @@ final class FacebookPostSyncService
             }
 
             /*
-             * Only update the timestamp after successful processing.
-             * A bounded run has not necessarily fetched the full history.
+             * A bounded run may not have fetched the full history.
              */
             if (! $bounded) {
                 $page->last_synced_at = now();
                 $page->save();
             }
 
+            $statistics = [
+                'posts_fetched' => $postCount,
+                'posts_created' => $postsCreated,
+                'posts_updated' => $postsUpdated,
+            ];
+
             Log::info('Facebook post synchronization completed.', [
                 'page_internal_id' => $page->id,
                 'facebook_page_id' => $page->facebook_page_id,
                 'pages_processed' => $pageCount,
                 'posts_processed' => $postCount,
+                'posts_created' => $postsCreated,
+                'posts_updated' => $postsUpdated,
                 'comment_sync_count' => count($commentSyncIds),
                 'bounded_completion' => $bounded,
                 'last_synced_at_updated' => ! $bounded,
             ]);
 
-            return array_values($commentSyncIds);
+            return [
+                'post_ids' => array_values($commentSyncIds),
+                'statistics' => $statistics,
+                'pages_processed' => $pageCount,
+                'bounded_completion' => $bounded,
+                'last_synced_at_updated' => ! $bounded,
+            ];
         } catch (Throwable $exception) {
             Log::error('Facebook post synchronization failed.', [
                 'page_internal_id' => $page->id,
                 'facebook_page_id' => $page->facebook_page_id,
                 'pages_processed' => $pageCount,
                 'posts_processed' => $postCount,
+                'posts_created' => $postsCreated,
+                'posts_updated' => $postsUpdated,
                 'exception_class' => $exception::class,
                 'exception_message' => $exception->getMessage(),
             ]);
@@ -155,7 +189,7 @@ final class FacebookPostSyncService
     {
         if (! $page->exists) {
             throw new RuntimeException(
-                'Facebook page must exist before synchronization.'
+                'Facebook page must exist before synchronization.',
             );
         }
 
@@ -164,7 +198,7 @@ final class FacebookPostSyncService
             || trim($page->facebook_page_id) === ''
         ) {
             throw new RuntimeException(
-                'Facebook page does not have a valid Meta Page ID.'
+                'Facebook page does not have a valid Meta Page ID.',
             );
         }
     }
@@ -175,13 +209,13 @@ final class FacebookPostSyncService
 
         if (! is_string($token) || trim($token) === '') {
             throw new RuntimeException(
-                'Facebook page does not have a valid access token.'
+                'Facebook page does not have a valid access token.',
             );
         }
 
         if ($page->hasExpiredToken()) {
             throw new RuntimeException(
-                'Facebook page access token has expired. Reconnect the page.'
+                'Facebook page access token has expired. Reconnect the page.',
             );
         }
 

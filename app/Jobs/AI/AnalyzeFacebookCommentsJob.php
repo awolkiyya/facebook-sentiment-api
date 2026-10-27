@@ -24,35 +24,23 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
     use Queueable;
     use SerializesModels;
 
-    /*
-    |--------------------------------------------------------------------------
-    | Queue Configuration
-    |--------------------------------------------------------------------------
-    */
+    private const MAX_FAILURE_HISTORY = 100;
 
-    /**
-     * Number of attempts before the job is permanently failed.
-     */
     public int $tries = 3;
 
-    /**
-     * Maximum execution time in seconds.
-     */
     public int $timeout = 120;
 
-    /*
-    |--------------------------------------------------------------------------
-    | Retry Configuration
-    |--------------------------------------------------------------------------
-    */
+    /**
+     * @param array<int, string> $commentIds Local FacebookComment UUIDs.
+     */
+    public function __construct(
+        public readonly array $commentIds,
+        public readonly string $syncRunId,
+    ) {
+        $this->onQueue('facebook-ai');
+    }
 
     /**
-     * Retry delays in seconds.
-     *
-     * Attempt 1 → fail → wait 10 seconds
-     * Attempt 2 → fail → wait 30 seconds
-     * Attempt 3 → fail → permanently fail
-     *
      * @return array<int, int>
      */
     public function backoff(): array
@@ -60,55 +48,11 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
         return [10, 30, 60];
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Constructor
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Create a new Facebook comment AI analysis job.
-     *
-     * @param array<int, string> $commentIds
-     * @param string $syncRunId
-     */
-    public function __construct(
-        public readonly array $commentIds,
-        public readonly string $syncRunId,
-    ) {
-        /*
-         * All Facebook-related AI processing uses the
-         * dedicated facebook-ai queue.
-         */
-        $this->onQueue('facebook-ai');
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Handle
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Execute the Facebook comment AI analysis job.
-     *
-     * This job is intentionally kept as an orchestration layer.
-     *
-     * AiOrchestrator owns the actual AI business logic.
-     */
     public function handle(
-        AiOrchestrator $orchestrator,
+        AIOrchestrator $orchestrator,
         FacebookSyncRunService $syncRunService,
     ): void {
-        /*
-        |--------------------------------------------------------------------------
-        | Validate Sync Run ID
-        |--------------------------------------------------------------------------
-        */
-
-        $syncRunId = trim(
-            $this->syncRunId,
-        );
+        $syncRunId = trim($this->syncRunId);
 
         if ($syncRunId === '') {
             throw new AIException(
@@ -116,55 +60,9 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
             );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Normalize Comment IDs
-        |--------------------------------------------------------------------------
-        */
+        $commentIds = $this->normalizeCommentIds($this->commentIds);
 
-        $commentIds = $this->normalizeCommentIds(
-            $this->commentIds,
-        );
-
-        if ($commentIds === []) {
-            Log::warning(
-                'Facebook comment AI analysis skipped because '
-                . 'no valid comment IDs were supplied.',
-                [
-                    'sync_run_id' =>
-                        $syncRunId,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempt' =>
-                        $this->attempts(),
-                ],
-            );
-
-            /*
-             * The parent comment-sync job should normally never
-             * dispatch an empty AI batch.
-             *
-             * However, if an empty batch reaches the queue, resolve
-             * its pipeline stage so the SyncRun cannot remain stuck.
-             */
-            $this->markPipelineCompleted(
-                $syncRunService,
-                $syncRunId,
-            );
-
-            return;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Load Sync Run
-        |--------------------------------------------------------------------------
-        */
-
-        $syncRun = FacebookSyncRun::query()
-            ->find($syncRunId);
+        $syncRun = FacebookSyncRun::query()->find($syncRunId);
 
         if ($syncRun === null) {
             throw new AIException(
@@ -172,40 +70,15 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
             );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Validate Sync Run State
-        |--------------------------------------------------------------------------
-        |
-        | AI processing belongs to an active synchronization pipeline.
-        |
-        | If another process has already completed or failed the entire
-        | SyncRun, this job must not attempt to modify the terminal run.
-        |
-        */
-
-        if (
-            $syncRun->status === null
-            || $syncRun->status->value !== 'running'
-        ) {
+        if (! $this->isRunRunning($syncRun)) {
             Log::warning(
-                'Facebook comment AI analysis skipped because '
-                . 'the synchronization run is not running.',
+                'Facebook comment AI analysis skipped because the sync run is not running.',
                 [
-                    'sync_run_id' =>
-                        (string) $syncRun->id,
-
-                    'status' =>
-                        $syncRun->status?->value,
-
-                    'comment_ids' =>
-                        $commentIds,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempt' =>
-                        $this->attempts(),
+                    'sync_run_id' => (string) $syncRun->id,
+                    'status' => $this->statusValue($syncRun),
+                    'comment_count' => count($commentIds),
+                    'job_id' => $this->job?->getJobId(),
+                    'attempt' => $this->attempts(),
                 ],
             );
 
@@ -213,221 +86,110 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
         }
 
         /*
-        |--------------------------------------------------------------------------
-        | Load Comments
-        |--------------------------------------------------------------------------
-        |
-        | IMPORTANT:
-        |
-        | facebook_comments.id is the internal Laravel UUID.
-        |
-        | The facebook_comments table does NOT contain a
-        | facebook_page_id column.
-        |
-        | A FacebookComment belongs to a FacebookPost through:
-        |
-        |     facebook_comments.facebook_post_id
-        |
-        | Therefore comments must be loaded directly by their
-        | internal comment IDs supplied to this job.
-        |
-        */
+         * Empty batches should not normally be dispatched. If one is
+         * received, account for it once so the pipeline cannot remain
+         * waiting for a job that has no work to perform.
+         */
+        if ($commentIds === []) {
+            Log::warning(
+                'Facebook comment AI analysis received an empty batch.',
+                [
+                    'sync_run_id' => $syncRunId,
+                    'job_id' => $this->job?->getJobId(),
+                    'attempt' => $this->attempts(),
+                ],
+            );
+
+            $this->recordPipelineOutcomeOnce(
+                syncRunService: $syncRunService,
+                syncRunId: $syncRunId,
+                outcome: 'completed',
+                commentIds: [],
+            );
+
+            $syncRunService->completePipelineIfReady(
+                runId: $syncRunId,
+            );
+
+            return;
+        }
 
         Log::debug(
             'Loading Facebook comments for AI analysis.',
             [
-                'sync_run_id' =>
-                    (string) $syncRun->id,
-
-                'comment_ids' =>
-                    $commentIds,
-
-                'comment_count_requested' =>
-                    count($commentIds),
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
+                'sync_run_id' => $syncRunId,
+                'comment_count_requested' => count($commentIds),
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
             ],
         );
 
         $comments = FacebookComment::query()
-            ->whereIn(
-                'id',
-                $commentIds,
-            )
+            ->whereIn('id', $commentIds)
             ->get();
 
-        /*
-        |--------------------------------------------------------------------------
-        | Log Loaded Comments
-        |--------------------------------------------------------------------------
-        */
-
-        Log::debug(
-            'Facebook comments loaded for AI analysis.',
-            [
-                'sync_run_id' =>
-                    (string) $syncRun->id,
-
-                'comment_count_requested' =>
-                    count($commentIds),
-
-                'comment_count_found' =>
-                    $comments->count(),
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
-            ],
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Validate Complete Batch
-        |--------------------------------------------------------------------------
-        |
-        | Never silently process only part of the requested batch.
-        |
-        */
-
-        if (
-            $comments->count()
-            !== count($commentIds)
-        ) {
+        if ($comments->count() !== count($commentIds)) {
             $foundIds = $comments
                 ->pluck('id')
-                ->map(
-                    static fn ($id): string =>
-                        (string) $id,
-                )
+                ->map(static fn ($id): string => (string) $id)
                 ->all();
 
             $missingIds = array_values(
-                array_diff(
-                    $commentIds,
-                    $foundIds,
-                ),
+                array_diff($commentIds, $foundIds),
             );
 
             Log::error(
-                'Some Facebook comments could not be loaded '
-                . 'for AI analysis.',
+                'Some Facebook comments could not be loaded for AI analysis.',
                 [
-                    'sync_run_id' =>
-                        (string) $syncRun->id,
-
-                    'requested_comment_ids' =>
-                        $commentIds,
-
-                    'found_comment_ids' =>
-                        $foundIds,
-
-                    'missing_comment_ids' =>
-                        $missingIds,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempt' =>
-                        $this->attempts(),
+                    'sync_run_id' => $syncRunId,
+                    'requested_count' => count($commentIds),
+                    'found_count' => $comments->count(),
+                    'missing_comment_ids' => $missingIds,
+                    'job_id' => $this->job?->getJobId(),
+                    'attempt' => $this->attempts(),
                 ],
             );
 
             throw new AIException(
                 'Some Facebook comments could not be found for '
-                . "sync run '{$syncRunId}': "
-                . implode(', ', $missingIds),
+                . "sync run '{$syncRunId}'. Missing count: "
+                . count($missingIds),
             );
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Start Logging
-        |--------------------------------------------------------------------------
-        */
 
         Log::info(
             'Facebook comment AI analysis started.',
             [
-                'sync_run_id' =>
-                    (string) $syncRun->id,
-
-                'facebook_page_id' =>
-                    isset($syncRun->facebook_page_id)
-                        ? (string) $syncRun->facebook_page_id
-                        : null,
-
-                'comments_count' =>
-                    $comments->count(),
-
-                'comment_ids' =>
-                    $commentIds,
-
-                'queue' =>
-                    $this->queue,
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
+                'sync_run_id' => $syncRunId,
+                'facebook_page_id' => $syncRun->facebook_page_id !== null
+                    ? (string) $syncRun->facebook_page_id
+                    : null,
+                'comments_count' => $comments->count(),
+                'queue' => $this->queue,
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
             ],
         );
 
         /*
-        |--------------------------------------------------------------------------
-        | Analyze Comments
-        |--------------------------------------------------------------------------
-        |
-        | AiOrchestrator owns:
-        |
-        | - comment validation
-        | - active model resolution
-        | - AI service communication
-        | - response validation
-        | - model-version consistency
-        | - sentiment persistence
-        | - topic/priority/language processing
-        | - latest AI snapshot handling
-        |
-        */
-
+         * AIOrchestrator remains responsible for inference, response
+         * validation, model versioning, and sentiment persistence.
+         *
+         * Do not increment the pipeline counter until analysis succeeds.
+         * If analysis throws, Laravel may retry this job.
+         */
         try {
-            $orchestrator->analyzeComments(
-                $comments,
-            );
+            $orchestrator->analyzeComments($comments);
         } catch (Throwable $exception) {
             Log::error(
-                'Facebook comment AI analysis failed during '
-                . 'orchestrator processing.',
+                'Facebook comment AI analysis failed during orchestrator processing.',
                 [
-                    'sync_run_id' =>
-                        (string) $syncRun->id,
-
-                    'comment_ids' =>
-                        $commentIds,
-
-                    'comments_count' =>
-                        $comments->count(),
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempt' =>
-                        $this->attempts(),
-
-                    'exception_class' =>
-                        $exception::class,
-
-                    'exception_message' =>
-                        $this->safeErrorMessage(
-                            $exception,
-                        ),
+                    'sync_run_id' => $syncRunId,
+                    'comment_count' => $comments->count(),
+                    'job_id' => $this->job?->getJobId(),
+                    'attempt' => $this->attempts(),
+                    'exception_class' => $exception::class,
+                    'exception_message' => $this->safeErrorMessage($exception),
                 ],
             );
 
@@ -435,101 +197,179 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
         }
 
         /*
-        |--------------------------------------------------------------------------
-        | Mark Pipeline Stage Completed
-        |--------------------------------------------------------------------------
-        |
-        | The AI operation succeeded.
-        |
-        | Therefore:
-        |
-        |     comment_ai_jobs_completed += 1
-        |
-        | Then ask the SyncRun service whether every pipeline stage
-        | has reached a terminal state.
-        |
-        */
-
-        Log::debug(
-            'Facebook comment AI analysis succeeded. '
-            . 'Updating pipeline completion counter.',
-            [
-                'sync_run_id' =>
-                    (string) $syncRun->id,
-
-                'comments_analyzed' =>
-                    $comments->count(),
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
-            ],
-        );
-
-        $syncRunService->incrementPipeline(
-            runId: (string) $syncRun->id,
-            counters: [
-                'comment_ai_jobs_completed' => 1,
-            ],
+         * Record the successful batch once. A retry or duplicate execution
+         * with the same batch will not increment this counter again.
+         */
+        $this->recordPipelineOutcomeOnce(
+            syncRunService: $syncRunService,
+            syncRunId: $syncRunId,
+            outcome: 'completed',
+            commentIds: $commentIds,
         );
 
         $syncRunService->completePipelineIfReady(
-            runId: (string) $syncRun->id,
+            runId: $syncRunId,
         );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Success Logging
-        |--------------------------------------------------------------------------
-        */
 
         Log::info(
             'Facebook comment AI analysis completed.',
             [
-                'sync_run_id' =>
-                    (string) $syncRun->id,
-
-                'facebook_page_id' =>
-                    isset($syncRun->facebook_page_id)
-                        ? (string) $syncRun->facebook_page_id
-                        : null,
-
-                'comments_analyzed' =>
-                    $comments->count(),
-
-                'comment_ids' =>
-                    $commentIds,
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
+                'sync_run_id' => $syncRunId,
+                'comments_analyzed' => $comments->count(),
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
             ],
         );
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | ID Normalization
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Normalize internal FacebookComment UUIDs.
-     *
-     * @param mixed $commentIds
-     * @return array<int, string>
+     * Laravel calls this after the job exhausts its retries.
      */
-    private function normalizeCommentIds(
-        mixed $commentIds,
-    ): array {
-        if (! is_array($commentIds)) {
-            return [];
+    public function failed(?Throwable $exception): void
+    {
+        $syncRunId = trim($this->syncRunId);
+        $commentIds = $this->normalizeCommentIds($this->commentIds);
+
+        Log::error(
+            'Facebook comment AI analysis job failed permanently.',
+            [
+                'sync_run_id' => $syncRunId !== '' ? $syncRunId : null,
+                'comment_count' => count($commentIds),
+                'job_id' => $this->job?->getJobId(),
+                'attempts' => $this->attempts(),
+                'exception_class' => $exception !== null
+                    ? $exception::class
+                    : null,
+                'exception_message' => $this->safeErrorMessage($exception),
+            ],
+        );
+
+        if ($syncRunId === '') {
+            return;
         }
 
+        $syncRun = FacebookSyncRun::query()->find($syncRunId);
+
+        if ($syncRun === null) {
+            Log::warning(
+                'Cannot record permanent comment AI failure because the sync run was not found.',
+                [
+                    'sync_run_id' => $syncRunId,
+                    'job_id' => $this->job?->getJobId(),
+                ],
+            );
+
+            return;
+        }
+
+        /*
+         * Persist failure details separately from pipeline counters.
+         * Metadata failure must not prevent pipeline failure accounting.
+         */
+        $this->recordFailureMetadata(
+            syncRun: $syncRun,
+            exception: $exception,
+            commentIds: $commentIds,
+        );
+
+        if (! $this->isRunRunning($syncRun)) {
+            Log::warning(
+                'Permanent comment AI failure was not added to pipeline counters because the sync run is no longer running.',
+                [
+                    'sync_run_id' => (string) $syncRun->id,
+                    'status' => $this->statusValue($syncRun),
+                    'job_id' => $this->job?->getJobId(),
+                ],
+            );
+
+            return;
+        }
+
+        try {
+            /** @var FacebookSyncRunService $syncRunService */
+            $syncRunService = app(FacebookSyncRunService::class);
+
+            $this->recordPipelineOutcomeOnce(
+                syncRunService: $syncRunService,
+                syncRunId: (string) $syncRun->id,
+                outcome: 'failed',
+                commentIds: $commentIds,
+            );
+
+            $syncRunService->completePipelineIfReady(
+                runId: (string) $syncRun->id,
+            );
+        } catch (Throwable $pipelineException) {
+            Log::critical(
+                'Failed to update the Facebook comment AI pipeline after permanent job failure.',
+                [
+                    'sync_run_id' => (string) $syncRun->id,
+                    'job_id' => $this->job?->getJobId(),
+                    'original_exception_class' => $exception !== null
+                        ? $exception::class
+                        : null,
+                    'original_exception_message' => $this->safeErrorMessage(
+                        $exception,
+                    ),
+                    'pipeline_exception_class' => $pipelineException::class,
+                    'pipeline_exception_message' => $this->safeErrorMessage(
+                        $pipelineException,
+                    ),
+                ],
+            );
+        }
+    }
+
+    /**
+     * Increment a pipeline outcome once for this sync run and batch.
+     *
+     * The operation key is deterministic for the run, outcome, and batch.
+     * This makes repeated accounting attempts idempotent.
+     *
+     * @param array<int, string> $commentIds
+     */
+    private function recordPipelineOutcomeOnce(
+        FacebookSyncRunService $syncRunService,
+        string $syncRunId,
+        string $outcome,
+        array $commentIds,
+    ): void {
+        if (! in_array($outcome, ['completed', 'failed'], true)) {
+            throw new AIException(
+                "Unsupported comment AI pipeline outcome '{$outcome}'.",
+            );
+        }
+
+        $counter = $outcome === 'completed'
+            ? 'comment_ai_jobs_completed'
+            : 'comment_ai_jobs_failed';
+
+        $canonicalIds = $commentIds;
+        sort($canonicalIds, SORT_STRING);
+
+        $operationKey = 'comment-ai:'
+            . $outcome
+            . ':'
+            . hash(
+                'sha256',
+                $syncRunId . '|' . implode('|', $canonicalIds),
+            );
+
+        $syncRunService->incrementPipelineOnce(
+            runId: $syncRunId,
+            operationKey: $operationKey,
+            counters: [
+                $counter => 1,
+            ],
+        );
+    }
+
+    /**
+     * @param array<int, string> $commentIds
+     * @return array<int, string>
+     */
+    private function normalizeCommentIds(array $commentIds): array
+    {
         $normalized = [];
 
         foreach ($commentIds as $commentId) {
@@ -537,391 +377,109 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
                 continue;
             }
 
-            $commentId = trim(
-                $commentId,
-            );
+            $commentId = trim($commentId);
 
             if ($commentId === '') {
                 continue;
             }
 
-            /*
-             * Associative-key deduplication prevents the same
-             * comment from being processed twice within one job.
-             */
             $normalized[$commentId] = $commentId;
         }
 
-        return array_values(
-            $normalized,
-        );
+        return array_values($normalized);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Pipeline Completion Helper
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Mark an empty comment-AI batch as completed.
-     *
-     * This is defensive handling. Normally an empty batch should never
-     * be dispatched by SyncFacebookCommentsJob.
-     */
-    private function markPipelineCompleted(
-        FacebookSyncRunService $syncRunService,
-        string $syncRunId,
-    ): void {
-        try {
-            $syncRunService->incrementPipeline(
-                runId: $syncRunId,
-                counters: [
-                    'comment_ai_jobs_completed' => 1,
-                ],
-            );
-
-            $syncRunService->completePipelineIfReady(
-                runId: $syncRunId,
-            );
-        } catch (Throwable $exception) {
-            Log::error(
-                'Failed to update Facebook comment AI pipeline '
-                . 'completion state.',
-                [
-                    'sync_run_id' =>
-                        $syncRunId,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'exception_class' =>
-                        $exception::class,
-
-                    'exception_message' =>
-                        $this->safeErrorMessage(
-                            $exception,
-                        ),
-                ],
-            );
-
-            throw $exception;
-        }
+    private function isRunRunning(FacebookSyncRun $syncRun): bool
+    {
+        return $this->statusValue($syncRun) === 'running';
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Permanent Failure
-    |--------------------------------------------------------------------------
-    */
+    private function statusValue(FacebookSyncRun $syncRun): ?string
+    {
+        $status = $syncRun->status;
 
-    /**
-     * Handle permanent failure after all retry attempts.
-     *
-     * A failed AI batch does not fail the entire SyncRun.
-     *
-     * Instead:
-     *
-     *     comment_ai_jobs_failed += 1
-     *
-     * This allows the overall synchronization pipeline to reach
-     * COMPLETED while accurately recording the AI failure.
-     */
-    public function failed(
-        ?Throwable $exception,
-    ): void {
-        $syncRunId = trim(
-            $this->syncRunId,
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Log Permanent Failure
-        |--------------------------------------------------------------------------
-        */
-
-        Log::error(
-            'Facebook comment AI analysis job failed permanently.',
-            [
-                'sync_run_id' =>
-                    $syncRunId !== ''
-                        ? $syncRunId
-                        : null,
-
-                'comment_ids' =>
-                    $this->commentIds,
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempts' =>
-                    $this->attempts(),
-
-                'exception_class' =>
-                    $exception !== null
-                        ? $exception::class
-                        : null,
-
-                'exception_message' =>
-                    $this->safeErrorMessage(
-                        $exception,
-                    ),
-            ],
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Validate Sync Run ID
-        |--------------------------------------------------------------------------
-        */
-
-        if ($syncRunId === '') {
-            return;
+        if (is_object($status) && isset($status->value)) {
+            return (string) $status->value;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Load Sync Run
-        |--------------------------------------------------------------------------
-        */
-
-        $syncRun = FacebookSyncRun::query()
-            ->find($syncRunId);
-
-        if ($syncRun === null) {
-            Log::warning(
-                'Facebook comment AI failure could not be '
-                . 'associated with a sync run.',
-                [
-                    'sync_run_id' =>
-                        $syncRunId,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-                ],
-            );
-
-            return;
+        if (is_string($status)) {
+            return $status;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Record Failure Metadata
-        |--------------------------------------------------------------------------
-        */
-
-        $this->recordFailureMetadata(
-            $syncRun,
-            $exception,
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Update Pipeline Failure Counter
-        |--------------------------------------------------------------------------
-        */
-
-        try {
-            $syncRunService = app(
-                FacebookSyncRunService::class,
-            );
-
-            /*
-             * Do not modify a terminal SyncRun.
-             */
-            if (
-                $syncRun->status !== null
-                && $syncRun->status->value === 'running'
-            ) {
-                $syncRunService->incrementPipeline(
-                    runId: (string) $syncRun->id,
-                    counters: [
-                        'comment_ai_jobs_failed' => 1,
-                    ],
-                );
-
-                /*
-                 * This may complete the entire SyncRun if all
-                 * other pipeline stages are also terminal.
-                 */
-                $syncRunService->completePipelineIfReady(
-                    runId: (string) $syncRun->id,
-                );
-            } else {
-                Log::warning(
-                    'Facebook comment AI failure pipeline counter '
-                    . 'was not updated because the sync run is no '
-                    . 'longer running.',
-                    [
-                        'sync_run_id' =>
-                            (string) $syncRun->id,
-
-                        'status' =>
-                            $syncRun->status?->value,
-
-                        'job_id' =>
-                            $this->job?->getJobId(),
-                    ],
-                );
-            }
-        } catch (Throwable $pipelineException) {
-            /*
-             * Pipeline accounting failure must be visible.
-             *
-             * Do not replace the original AI failure with the
-             * accounting exception.
-             */
-            Log::critical(
-                'Failed to update Facebook comment AI pipeline '
-                . 'failure state after permanent job failure.',
-                [
-                    'sync_run_id' =>
-                        (string) $syncRun->id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'original_exception' =>
-                        $this->safeErrorMessage(
-                            $exception,
-                        ),
-
-                    'pipeline_exception_class' =>
-                        $pipelineException::class,
-
-                    'pipeline_exception_message' =>
-                        $this->safeErrorMessage(
-                            $pipelineException,
-                        ),
-                ],
-            );
-        }
+        return null;
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Failure Metadata
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Record a bounded list of permanent AI failures.
+     * Record a bounded history of permanent AI failures.
+     *
+     * @param array<int, string> $commentIds
      */
     private function recordFailureMetadata(
         FacebookSyncRun $syncRun,
         ?Throwable $exception,
+        array $commentIds,
     ): void {
-        $metadata = $syncRun->metadata ?? [];
+        try {
+            $metadata = $syncRun->metadata ?? [];
 
-        if (! is_array($metadata)) {
-            $metadata = [];
-        }
+            if (! is_array($metadata)) {
+                $metadata = [];
+            }
 
-        $aiFailures =
-            $metadata['comment_ai_failures'] ?? [];
+            $failures = $metadata['comment_ai_failures'] ?? [];
 
-        if (! is_array($aiFailures)) {
-            $aiFailures = [];
-        }
+            if (! is_array($failures)) {
+                $failures = [];
+            }
 
-        $aiFailures[] = [
-            'comment_ids' =>
-                $this->commentIds,
-
-            'job_id' =>
-                $this->job?->getJobId(),
-
-            'attempts' =>
-                $this->attempts(),
-
-            'exception_class' =>
-                $exception !== null
+            $failures[] = [
+                'comment_ids' => $commentIds,
+                'job_id' => $this->job?->getJobId(),
+                'attempts' => $this->attempts(),
+                'exception_class' => $exception !== null
                     ? $exception::class
                     : null,
+                'error' => $this->safeErrorMessage($exception),
+                'failed_at' => now()->toISOString(),
+            ];
 
-            'error' =>
-                $this->safeErrorMessage(
-                    $exception,
-                ),
+            $metadata['comment_ai_failures'] = array_slice(
+                $failures,
+                -self::MAX_FAILURE_HISTORY,
+            );
 
-            'failed_at' =>
-                now()->toISOString(),
-        ];
-
-        /*
-         * Prevent unlimited metadata growth.
-         */
-        $aiFailures = array_slice(
-            $aiFailures,
-            -100,
-        );
-
-        try {
             $syncRun->forceFill([
-                'metadata' => array_merge(
-                    $metadata,
-                    [
-                        'comment_ai_failures' =>
-                            $aiFailures,
-                    ],
-                ),
+                'metadata' => $metadata,
             ])->save();
         } catch (Throwable $metadataException) {
-            /*
-             * Metadata persistence must not hide the original
-             * queue failure.
-             */
             Log::error(
-                'Failed to persist Facebook comment AI failure '
-                . 'metadata.',
+                'Failed to persist Facebook comment AI failure metadata.',
                 [
-                    'sync_run_id' =>
-                        (string) $syncRun->id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'exception_class' =>
-                        $metadataException::class,
-
-                    'exception_message' =>
-                        $this->safeErrorMessage(
-                            $metadataException,
-                        ),
+                    'sync_run_id' => (string) $syncRun->id,
+                    'job_id' => $this->job?->getJobId(),
+                    'exception_class' => $metadataException::class,
+                    'exception_message' => $this->safeErrorMessage(
+                        $metadataException,
+                    ),
                 ],
             );
         }
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Error Sanitization
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Return a safe error message for logs/metadata.
+     * Sanitize error messages before writing them to logs or metadata.
      */
-    private function safeErrorMessage(
-        ?Throwable $exception,
-    ): ?string {
+    private function safeErrorMessage(?Throwable $exception): ?string
+    {
         if ($exception === null) {
             return null;
         }
 
-        $message = trim(
-            $exception->getMessage(),
-        );
+        $message = trim($exception->getMessage());
 
         if ($message === '') {
             return $exception::class;
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Remove Sensitive Meta Query Parameters
-        |--------------------------------------------------------------------------
-        */
 
         $message = preg_replace(
             '/([?&](?:access_token|appsecret_proof)=)[^&\s]*/i',
@@ -929,28 +487,12 @@ class AnalyzeFacebookCommentsJob implements ShouldQueue
             $message,
         ) ?? $message;
 
-        /*
-        |--------------------------------------------------------------------------
-        | Remove Authorization Bearer Tokens
-        |--------------------------------------------------------------------------
-        */
-
         $message = preg_replace(
             '/(Authorization:\s*Bearer\s+)[^\s,]+/i',
             '$1[REDACTED]',
             $message,
         ) ?? $message;
 
-        /*
-        |--------------------------------------------------------------------------
-        | Limit Error Size
-        |--------------------------------------------------------------------------
-        */
-
-        return mb_substr(
-            $message,
-            0,
-            5000,
-        );
+        return mb_substr($message, 0, 5000);
     }
 }

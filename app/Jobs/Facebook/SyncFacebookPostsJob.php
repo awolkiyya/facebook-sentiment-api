@@ -27,19 +27,11 @@ class SyncFacebookPostsJob implements ShouldQueue
     use Queueable;
     use SerializesModels;
 
-    /**
-     * Maximum attempts before permanent failure.
-     */
     public int $tries = 3;
 
-    /**
-     * Maximum execution time: 30 minutes.
-     */
     public int $timeout = 1800;
 
     /**
-     * Retry delays in seconds.
-     *
      * @return array<int, int>
      */
     public function backoff(): array
@@ -63,10 +55,6 @@ class SyncFacebookPostsJob implements ShouldQueue
         ];
     }
 
-    /**
-     * @param string $facebookPageUuid Local facebook_pages.id UUID.
-     * @param string $syncRunId        facebook_sync_runs.id.
-     */
     public function __construct(
         public readonly string $facebookPageUuid,
         public readonly string $syncRunId,
@@ -74,11 +62,6 @@ class SyncFacebookPostsJob implements ShouldQueue
         $this->onQueue('facebook');
     }
 
-    /**
-     * Synchronize posts and dispatch comment synchronization jobs.
-     *
-     * This job does not dispatch post-topic AI analysis.
-     */
     public function handle(
         FacebookPostSyncService $postSyncService,
         FacebookSyncRunService $syncRunService,
@@ -142,13 +125,6 @@ class SyncFacebookPostsJob implements ShouldQueue
 
         $queueJobId = $this->job?->getJobId();
 
-        /*
-         * Initialize the pipeline.
-         *
-         * Post-AI counters remain zero for compatibility with existing
-         * pipeline metadata and completion logic. This job does not
-         * dispatch post-AI jobs.
-         */
         $syncRun = $syncRunService->initializePipeline(
             runId: (string) $syncRun->id,
             counters: [
@@ -185,9 +161,6 @@ class SyncFacebookPostsJob implements ShouldQueue
         );
 
         try {
-            /*
-             * Load system settings.
-             */
             $settings = SystemSetting::query()->first();
 
             if ($settings === null) {
@@ -196,9 +169,6 @@ class SyncFacebookPostsJob implements ShouldQueue
                 );
             }
 
-            /*
-             * Validate the global Facebook synchronization switch.
-             */
             if (! (bool) $settings->facebook_sync_enabled) {
                 Log::warning(
                     'Facebook synchronization is disabled.',
@@ -218,18 +188,12 @@ class SyncFacebookPostsJob implements ShouldQueue
                 return;
             }
 
-            /*
-             * Validate the page.
-             */
             if (! $page->is_active) {
                 throw new RuntimeException(
                     "Facebook Page '{$page->id}' is inactive.",
                 );
             }
 
-            /*
-             * Synchronize Facebook posts.
-             */
             Log::info(
                 'Starting Facebook post synchronization service.',
                 [
@@ -241,35 +205,58 @@ class SyncFacebookPostsJob implements ShouldQueue
                 ],
             );
 
+            /*
+             * Expected service response:
+             *
+             * [
+             *     'post_ids' => [...],
+             *     'statistics' => [
+             *         'posts_fetched' => int,
+             *         'posts_created' => int,
+             *         'posts_updated' => int,
+             *     ],
+             *     'pages_processed' => int,
+             *     'bounded_completion' => bool,
+             *     'last_synced_at_updated' => bool,
+             * ]
+             */
             $syncResult = $postSyncService->sync(page: $page);
 
-            if (! is_array($syncResult)) {
+            if (
+                ! is_array($syncResult)
+                || ! isset($syncResult['post_ids'])
+                || ! is_array($syncResult['post_ids'])
+                || ! isset($syncResult['statistics'])
+                || ! is_array($syncResult['statistics'])
+            ) {
                 throw new RuntimeException(
-                    'Facebook post synchronization service returned an invalid result.',
+                    'Facebook post synchronization service returned '
+                    . 'an invalid result structure.',
                 );
             }
 
-            /*
-             * IMPORTANT:
-             *
-             * FacebookPostSyncService::sync() returns a flat array of
-             * local FacebookPost UUIDs that require comment synchronization.
-             *
-             * It does NOT return:
-             *
-             * [
-             *     'comment_sync' => [...],
-             * ]
-             *
-             * Therefore, normalize the returned array directly.
-             *
-             * This prevents eligible post IDs from being discarded and
-             * the downstream comment job count incorrectly becoming zero.
-             *
-             * If your service contract is changed later to return an
-             * associative result, update this extraction accordingly.
-             */
-            $commentSyncPostIds = $this->normalizePostIds($syncResult);
+            $commentSyncPostIds = $this->normalizePostIds(
+                $syncResult['post_ids'],
+            );
+
+            $postStatistics = $syncResult['statistics'];
+
+            foreach ([
+                'posts_fetched',
+                'posts_created',
+                'posts_updated',
+            ] as $statistic) {
+                if (
+                    ! array_key_exists($statistic, $postStatistics)
+                    || ! is_int($postStatistics[$statistic])
+                    || $postStatistics[$statistic] < 0
+                ) {
+                    throw new RuntimeException(
+                        "Facebook post synchronization returned "
+                        . "an invalid '{$statistic}' statistic.",
+                    );
+                }
+            }
 
             Log::info(
                 'Facebook post synchronization service completed.',
@@ -278,21 +265,61 @@ class SyncFacebookPostsJob implements ShouldQueue
                     'page_internal_id' => $page->id,
                     'facebook_page_id' => $page->facebook_page_id,
                     'posts_for_comment_sync' => count($commentSyncPostIds),
+                    'posts_fetched' => $postStatistics['posts_fetched'],
+                    'posts_created' => $postStatistics['posts_created'],
+                    'posts_updated' => $postStatistics['posts_updated'],
+                    'pages_processed' => $syncResult['pages_processed'] ?? null,
+                    'bounded_completion' => $syncResult['bounded_completion'] ?? null,
+                    'last_synced_at_updated' => $syncResult['last_synced_at_updated'] ?? null,
                     'job_id' => $queueJobId,
                     'attempt' => $this->attempts(),
                 ],
             );
 
             /*
-             * Calculate expected comment-sync jobs.
+             * Register statistics atomically and idempotently.
              *
-             * One logical comment-sync job is expected per eligible post.
+             * incrementStatisticsOnce() must update the statistic and record
+             * its operation key in the same database transaction.
+             */
+            foreach ([
+                'posts_fetched',
+                'posts_created',
+                'posts_updated',
+            ] as $statistic) {
+                $value = $postStatistics[$statistic];
+
+                $operationKey = $this->postStatisticOperationKey(
+                    $statistic,
+                );
+
+                $registration = $syncRunService->incrementStatisticsOnce(
+                    runId: (string) $syncRun->id,
+                    operationKey: $operationKey,
+                    statistics: [
+                        $statistic => $value,
+                    ],
+                );
+
+                $syncRun = $registration['run'];
+
+                Log::info(
+                    'Facebook post synchronization statistic registration processed.',
+                    [
+                        'sync_run_id' => $syncRun->id,
+                        'statistic' => $statistic,
+                        'value' => $value,
+                        'operation_key' => $operationKey,
+                        'operation_applied' => $registration['applied'],
+                    ],
+                );
+            }
+
+            /*
+             * Register the expected comment-sync workload.
              */
             $commentJobsExpected = count($commentSyncPostIds);
 
-            /*
-             * Register the expected workload exactly once.
-             */
             $expectedRegistrationKey = $this->expectedPipelineOperationKey(
                 $commentJobsExpected,
             );
@@ -319,14 +346,7 @@ class SyncFacebookPostsJob implements ShouldQueue
                     ],
                 );
 
-                $syncRun = $syncRun->fresh();
-
-                if ($syncRun === null) {
-                    throw new RuntimeException(
-                        "Facebook synchronization run '{$syncRunId}' "
-                        . 'could not be refreshed.',
-                    );
-                }
+                $syncRun = $this->refreshSyncRun($syncRunId);
             } else {
                 Log::info(
                     'Facebook comment-sync workload registration already exists.',
@@ -335,73 +355,6 @@ class SyncFacebookPostsJob implements ShouldQueue
                         'operation_key' => $expectedRegistrationKey,
                         'comment_jobs_expected' => $commentJobsExpected,
                     ],
-                );
-            }
-
-            /*
-             * Register post synchronization statistics idempotently.
-             *
-             * The service's flat-array return contract contains post IDs,
-             * not statistics. Statistics are registered only when the
-             * service explicitly returns the supported integer keys.
-             */
-            $postStatistics = [];
-
-            foreach ([
-                'posts_fetched',
-                'posts_created',
-                'posts_updated',
-            ] as $statistic) {
-                if (
-                    isset($syncResult[$statistic])
-                    && is_int($syncResult[$statistic])
-                    && $syncResult[$statistic] >= 0
-                ) {
-                    $postStatistics[$statistic] = $syncResult[$statistic];
-                }
-            }
-
-            foreach ($postStatistics as $statistic => $value) {
-                $operationKey = $this->postStatisticOperationKey(
-                    $statistic,
-                );
-
-                $registration = $syncRunService->incrementPipelineOnce(
-                    runId: (string) $syncRun->id,
-                    operationKey: $operationKey,
-                    counters: [],
-                );
-
-                if ($registration['applied']) {
-                    $syncRun = $syncRunService->incrementStatistics(
-                        runId: (string) $syncRun->id,
-                        statistics: [
-                            $statistic => $value,
-                        ],
-                    );
-                }
-
-                Log::info(
-                    'Facebook post synchronization statistic registration processed.',
-                    [
-                        'sync_run_id' => $syncRun->id,
-                        'statistic' => $statistic,
-                        'value' => $value,
-                        'operation_key' => $operationKey,
-                        'operation_applied' => $registration['applied'],
-                    ],
-                );
-            }
-
-            /*
-             * Refresh and protect against a terminal SyncRun.
-             */
-            $syncRun = $syncRun->fresh();
-
-            if ($syncRun === null) {
-                throw new RuntimeException(
-                    "Facebook synchronization run '{$syncRunId}' "
-                    . 'could not be refreshed.',
                 );
             }
 
@@ -415,7 +368,6 @@ class SyncFacebookPostsJob implements ShouldQueue
                         'page_internal_id' => $page->id,
                         'facebook_page_id' => $page->facebook_page_id,
                         'job_id' => $queueJobId,
-                        'attempt' => $this->attempts(),
                     ],
                 );
 
@@ -433,9 +385,6 @@ class SyncFacebookPostsJob implements ShouldQueue
                     $postId,
                 );
 
-                /*
-                 * Skip operations already registered by a previous attempt.
-                 */
                 if ($this->pipelineOperationExists(
                     $syncRun,
                     $operationKey,
@@ -457,22 +406,15 @@ class SyncFacebookPostsJob implements ShouldQueue
                 }
 
                 /*
-                 * Dispatch the comment synchronization job.
-                 *
-                 * SyncFacebookCommentsJob is in this namespace.
+                 * Dispatch and operation registration are separate actions.
+                 * A transactional outbox is required to eliminate the
+                 * crash window between queue dispatch and registration.
                  */
                 SyncFacebookCommentsJob::dispatch(
                     postId: $postId,
                     syncRunId: (string) $syncRun->id,
                 )->onQueue('facebook-comments');
 
-                /*
-                 * Register the dispatch operation.
-                 *
-                 * Note: dispatch and registration are separate operations.
-                 * A transactional outbox is recommended if guaranteed
-                 * recovery from process crashes is required.
-                 */
                 $registration = $syncRunService->incrementPipelineOnce(
                     runId: (string) $syncRun->id,
                     operationKey: $operationKey,
@@ -498,12 +440,9 @@ class SyncFacebookPostsJob implements ShouldQueue
                     ],
                 );
 
-                $syncRun = $syncRun->fresh();
+                $syncRun = $this->refreshSyncRun($syncRunId);
 
-                if (
-                    $syncRun !== null
-                    && $this->isTerminalSyncRun($syncRun)
-                ) {
+                if ($this->isTerminalSyncRun($syncRun)) {
                     Log::warning(
                         'Facebook post synchronization stopped during '
                         . 'comment dispatch because the SyncRun is terminal.',
@@ -516,18 +455,8 @@ class SyncFacebookPostsJob implements ShouldQueue
 
                     return;
                 }
-
-                if ($syncRun === null) {
-                    throw new RuntimeException(
-                        "Facebook synchronization run '{$syncRunId}' "
-                        . 'could not be refreshed during comment dispatch.',
-                    );
-                }
             }
 
-            /*
-             * Log comment queue results.
-             */
             Log::info(
                 'Facebook comment synchronization dispatch stage completed.',
                 [
@@ -541,9 +470,8 @@ class SyncFacebookPostsJob implements ShouldQueue
             );
 
             /*
-             * Complete immediately if there is no comment-sync work.
-             *
-             * Post-topic AI is not part of this pipeline's workload.
+             * If there is no comment-sync work, the pipeline can complete
+             * immediately, subject to the service's completion checks.
              */
             if ($commentJobsExpected === 0) {
                 $syncRun = $syncRunService->completePipelineIfReady(
@@ -551,8 +479,8 @@ class SyncFacebookPostsJob implements ShouldQueue
                 );
 
                 Log::info(
-                    'Facebook synchronization completed immediately '
-                    . 'because no comment-sync jobs were required.',
+                    'Facebook synchronization completion checked because '
+                    . 'no comment-sync jobs were required.',
                     [
                         'sync_run_id' => $syncRun->id,
                         'page_internal_id' => $page->id,
@@ -567,35 +495,27 @@ class SyncFacebookPostsJob implements ShouldQueue
                 return;
             }
 
-            /*
-             * Child comment-sync jobs are responsible for advancing
-             * pipeline completion.
-             */
-            $syncRun = $syncRun->fresh();
+            $syncRun = $this->refreshSyncRun($syncRunId);
 
             Log::info(
                 'Facebook post synchronization stage completed; '
                 . 'waiting for comment-sync jobs.',
                 [
-                    'sync_run_id' => $syncRun?->id,
+                    'sync_run_id' => $syncRun->id,
                     'page_internal_id' => $page->id,
                     'facebook_page_id' => $page->facebook_page_id,
                     'comment_jobs_expected' => $commentJobsExpected,
                     'comment_jobs_dispatched_this_attempt' => $commentJobsDispatched,
                     'comment_jobs_already_registered' => $commentJobsSkipped,
-                    'comment_ai_jobs_expected' => $syncRun !== null
-                        ? $this->pipelineCounter(
-                            $syncRun,
-                            'comment_ai_jobs_expected',
-                        )
-                        : 0,
+                    'comment_ai_jobs_expected' => $this->pipelineCounter(
+                        $syncRun,
+                        'comment_ai_jobs_expected',
+                    ),
                     'attempt' => $this->attempts(),
-                    'status' => $syncRun !== null
-                        ? $this->syncRunStatus($syncRun)
-                        : null,
-                    'pipeline_completed' => $syncRun !== null
-                        ? $this->pipelineCompleted($syncRun)
-                        : false,
+                    'status' => $this->syncRunStatus($syncRun),
+                    'pipeline_completed' => $this->pipelineCompleted(
+                        $syncRun,
+                    ),
                 ],
             );
         } catch (Throwable $exception) {
@@ -616,9 +536,6 @@ class SyncFacebookPostsJob implements ShouldQueue
                 ],
             );
 
-            /*
-             * Allow Laravel to retry. Permanent failure is handled below.
-             */
             throw $exception;
         }
     }
@@ -674,14 +591,10 @@ class SyncFacebookPostsJob implements ShouldQueue
         FacebookSyncRun $syncRun,
         string $operationKey,
     ): bool {
-        $pipeline = $this->pipelineMetadata($syncRun);
-        $operations = $pipeline['operations'] ?? [];
+        $operations = $this->pipelineMetadata($syncRun)['operations'] ?? [];
 
-        if (! is_array($operations)) {
-            return false;
-        }
-
-        return array_key_exists($operationKey, $operations);
+        return is_array($operations)
+            && array_key_exists($operationKey, $operations);
     }
 
     /**
@@ -723,11 +636,21 @@ class SyncFacebookPostsJob implements ShouldQueue
     ): int {
         $value = $this->pipelineMetadata($syncRun)[$counter] ?? 0;
 
-        if (! is_numeric($value)) {
-            return 0;
+        return is_numeric($value) ? max(0, (int) $value) : 0;
+    }
+
+    private function refreshSyncRun(string $syncRunId): FacebookSyncRun
+    {
+        $syncRun = FacebookSyncRun::query()->find($syncRunId);
+
+        if ($syncRun === null) {
+            throw new RuntimeException(
+                "Facebook synchronization run '{$syncRunId}' "
+                . 'could not be refreshed.',
+            );
         }
 
-        return max(0, (int) $value);
+        return $syncRun;
     }
 
     /*
@@ -745,10 +668,7 @@ class SyncFacebookPostsJob implements ShouldQueue
             return $status->value;
         }
 
-        if (
-            is_object($status)
-            && property_exists($status, 'value')
-        ) {
+        if (is_object($status) && property_exists($status, 'value')) {
             return (string) $status->value;
         }
 
@@ -769,6 +689,7 @@ class SyncFacebookPostsJob implements ShouldQueue
             [
                 FacebookSyncStatus::COMPLETED->value,
                 FacebookSyncStatus::FAILED->value,
+                FacebookSyncStatus::CANCELLED->value,
             ],
             true,
         );
@@ -783,14 +704,11 @@ class SyncFacebookPostsJob implements ShouldQueue
     /**
      * Normalize local FacebookPost UUIDs.
      *
-     * Accepts the flat array returned by FacebookPostSyncService.
-     *
      * @param mixed $postIds
      * @return array<int, string>
      */
-    private function normalizePostIds(
-        mixed $postIds,
-    ): array {
+    private function normalizePostIds(mixed $postIds): array
+    {
         if (! is_array($postIds)) {
             return [];
         }
@@ -804,11 +722,9 @@ class SyncFacebookPostsJob implements ShouldQueue
 
             $postId = trim($postId);
 
-            if ($postId === '') {
-                continue;
+            if ($postId !== '') {
+                $normalized[$postId] = $postId;
             }
-
-            $normalized[$postId] = $postId;
         }
 
         return array_values($normalized);
@@ -820,9 +736,8 @@ class SyncFacebookPostsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    public function failed(
-        ?Throwable $exception,
-    ): void {
+    public function failed(?Throwable $exception): void
+    {
         $syncRunId = trim($this->syncRunId);
 
         if ($syncRunId === '') {
@@ -836,9 +751,7 @@ class SyncFacebookPostsJob implements ShouldQueue
                     'exception_class' => $exception !== null
                         ? $exception::class
                         : null,
-                    'exception_message' => $this->safeErrorMessage(
-                        $exception,
-                    ),
+                    'exception_message' => $this->safeErrorMessage($exception),
                 ],
             );
 
@@ -859,9 +772,7 @@ class SyncFacebookPostsJob implements ShouldQueue
                     'exception_class' => $exception !== null
                         ? $exception::class
                         : null,
-                    'exception_message' => $this->safeErrorMessage(
-                        $exception,
-                    ),
+                    'exception_message' => $this->safeErrorMessage($exception),
                 ],
             );
 
@@ -904,9 +815,7 @@ class SyncFacebookPostsJob implements ShouldQueue
                     'exception_class' => $exception !== null
                         ? $exception::class
                         : null,
-                    'exception_message' => $this->safeErrorMessage(
-                        $exception,
-                    ),
+                    'exception_message' => $this->safeErrorMessage($exception),
                     'status' => $this->syncRunStatus($failedRun),
                 ],
             );
@@ -939,9 +848,8 @@ class SyncFacebookPostsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    private function safeErrorMessage(
-        ?Throwable $exception,
-    ): string {
+    private function safeErrorMessage(?Throwable $exception): string
+    {
         if ($exception === null) {
             return 'Facebook synchronization failed without an exception message.';
         }
@@ -952,27 +860,21 @@ class SyncFacebookPostsJob implements ShouldQueue
             return $exception::class;
         }
 
-        /*
-         * Remove sensitive query parameters.
-         */
+        // Remove sensitive query parameters.
         $message = preg_replace(
             '/([?&](?:access_token|appsecret_proof)=)[^&\s]*/i',
             '$1[REDACTED]',
             $message,
         ) ?? $message;
 
-        /*
-         * Remove bearer tokens.
-         */
+        // Remove bearer tokens.
         $message = preg_replace(
             '/(Bearer\s+)[A-Za-z0-9._~+\/=-]+/i',
             '$1[REDACTED]',
             $message,
         ) ?? $message;
 
-        /*
-         * Remove common API credentials.
-         */
+        // Remove common API credentials.
         $message = preg_replace(
             '/((?:access_token|appsecret_proof|api_key|apikey|secret|token)=)[^&\s]*/i',
             '$1[REDACTED]',

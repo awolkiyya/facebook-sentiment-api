@@ -34,29 +34,11 @@ class SyncFacebookCommentsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Number of attempts before the job is permanently failed.
-     */
     public int $tries = 3;
 
-    /**
-     * Maximum execution time in seconds.
-     */
     public int $timeout = 180;
 
-    /*
-    |--------------------------------------------------------------------------
-    | Retry Configuration
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Retry delays in seconds.
-     *
-     * Attempt 1 → fail → wait 10 seconds
-     * Attempt 2 → fail → wait 30 seconds
-     * Attempt 3 → fail → permanently fail
-     *
      * @return array<int, int>
      */
     public function backoff(): array
@@ -71,19 +53,8 @@ class SyncFacebookCommentsJob implements ShouldQueue
     */
 
     /**
-     * Create a new job instance.
-     *
-     * $postId is the local Laravel FacebookPost UUID:
-     *
-     *     facebook_posts.id
-     *
-     * It is NOT:
-     *
-     *     facebook_posts.facebook_post_id
-     *
-     * $syncRunId is the local Laravel FacebookSyncRun UUID:
-     *
-     *     facebook_sync_runs.id
+     * $postId is the local FacebookPost UUID.
+     * $syncRunId is the local FacebookSyncRun UUID.
      */
     public function __construct(
         public readonly string $postId,
@@ -99,10 +70,7 @@ class SyncFacebookCommentsJob implements ShouldQueue
     */
 
     /**
-     * Prevent two comment synchronization jobs for the same
-     * Facebook post from running simultaneously.
-     *
-     * Different posts can still synchronize concurrently.
+     * Prevent concurrent synchronization for the same local post.
      *
      * @return array<int, object>
      */
@@ -123,9 +91,6 @@ class SyncFacebookCommentsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Execute the Facebook comment synchronization job.
-     */
     public function handle(
         FacebookCommentSyncService $commentSyncService,
         FacebookSyncRunService $syncRunService,
@@ -153,7 +118,7 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
         /*
         |--------------------------------------------------------------------------
-        | Load Facebook Post
+        | Load Facebook Post and Page
         |--------------------------------------------------------------------------
         */
 
@@ -166,12 +131,6 @@ class SyncFacebookCommentsJob implements ShouldQueue
                 "Facebook post '{$postId}' was not found.",
             );
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Load Parent Facebook Page
-        |--------------------------------------------------------------------------
-        */
 
         $page = $post->facebookPage;
 
@@ -187,13 +146,10 @@ class SyncFacebookCommentsJob implements ShouldQueue
         |--------------------------------------------------------------------------
         */
 
-        $syncRun = FacebookSyncRun::query()
-            ->whereKey($syncRunId)
-            ->where(
-                'facebook_page_id',
-                $page->id,
-            )
-            ->first();
+        $syncRun = $this->reloadSyncRun(
+            $syncRunId,
+            (string) $page->id,
+        );
 
         if ($syncRun === null) {
             throw new RuntimeException(
@@ -202,85 +158,23 @@ class SyncFacebookCommentsJob implements ShouldQueue
             );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Log Job Start
-        |--------------------------------------------------------------------------
-        */
-
         Log::info(
             'Facebook comment synchronization job started.',
             [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'sync_run_status' =>
-                    $this->syncRunStatus($syncRun),
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'facebook_page_internal_id' =>
-                    $page->id,
-
-                'facebook_page_id' =>
-                    $page->facebook_page_id,
-
-                'queue' =>
-                    'facebook-comments',
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
-
-                'pipeline_operation_key' =>
-                    $this->pipelineOperationKey(),
+                'sync_run_id' => $syncRun->id,
+                'sync_run_status' => $this->syncRunStatus($syncRun),
+                'post_internal_id' => $post->id,
+                'facebook_post_id' => $post->facebook_post_id,
+                'facebook_page_internal_id' => $page->id,
+                'facebook_page_id' => $page->facebook_page_id,
+                'queue' => 'facebook-comments',
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
+                'pipeline_operation_key' => $this->pipelineOperationKey(),
             ],
         );
 
-        /*
-        |--------------------------------------------------------------------------
-        | Terminal SyncRun Protection
-        |--------------------------------------------------------------------------
-        |
-        | COMPLETED, FAILED and CANCELLED runs are terminal.
-        |
-        | A cancelled run must never continue processing.
-        */
-
-        if ($this->isTerminalSyncRun($syncRun)) {
-            Log::warning(
-                'Facebook comment synchronization job ignored because '
-                . 'the SyncRun is already terminal.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'sync_run_status' =>
-                        $this->syncRunStatus($syncRun),
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempt' =>
-                        $this->attempts(),
-                ],
-            );
-
+        if ($this->shouldStop($syncRun)) {
             return;
         }
 
@@ -296,46 +190,23 @@ class SyncFacebookCommentsJob implements ShouldQueue
                 jobId: $this->job?->getJobId(),
             );
         } catch (Throwable $exception) {
-            /*
-             * This is especially important for cancellation.
-             *
-             * If the user cancelled the run after we loaded it but
-             * before markRunning(), markRunning() will reject the
-             * transition from CANCELLED -> RUNNING.
-             *
-             * Re-load the run and stop cleanly if it was cancelled.
-             */
-            $latestRun = FacebookSyncRun::query()
-                ->find((string) $syncRun->id);
+            $latestRun = $this->reloadSyncRun(
+                $syncRunId,
+                (string) $page->id,
+            );
 
             if (
                 $latestRun !== null
-                && $latestRun->status === FacebookSyncStatus::CANCELLED
+                && $this->isTerminalSyncRun($latestRun)
             ) {
                 Log::warning(
-                    'Facebook comment synchronization job stopped because '
-                    . 'the SyncRun was cancelled before it could start.',
+                    'Facebook comment synchronization stopped '
+                    . 'because the SyncRun became terminal.',
                     [
-                        'sync_run_id' =>
-                            $latestRun->id,
-
-                        'sync_run_status' =>
-                            $this->syncRunStatus($latestRun),
-
-                        'post_internal_id' =>
-                            $post->id,
-
-                        'facebook_post_id' =>
-                            $post->facebook_post_id,
-
-                        'facebook_page_id' =>
-                            $page->facebook_page_id,
-
-                        'job_id' =>
-                            $this->job?->getJobId(),
-
-                        'attempt' =>
-                            $this->attempts(),
+                        'sync_run_id' => $latestRun->id,
+                        'sync_run_status' => $this->syncRunStatus($latestRun),
+                        'post_internal_id' => $post->id,
+                        'job_id' => $this->job?->getJobId(),
                     ],
                 );
 
@@ -345,51 +216,21 @@ class SyncFacebookCommentsJob implements ShouldQueue
             throw $exception;
         }
 
-        Log::info(
-            'Facebook comment synchronization SyncRun is running.',
-            [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'sync_run_status' =>
-                    $this->syncRunStatus($syncRun),
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'facebook_page_id' =>
-                    $page->facebook_page_id,
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
-            ],
-        );
-
         /*
         |--------------------------------------------------------------------------
-        | Cancellation Check After RUNNING Transition
+        | Initialize Pipeline
         |--------------------------------------------------------------------------
-        |
-        | The user may cancel the run immediately after markRunning().
-        *
-        * Always re-read the SyncRun before expensive external work.
         */
 
         $syncRun = $this->reloadSyncRun(
-            $syncRun->id,
-            $page->id,
+            (string) $syncRun->id,
+            (string) $page->id,
         );
 
         if ($syncRun === null) {
             throw new RuntimeException(
                 "Facebook synchronization run '{$syncRunId}' "
-                . "could not be reloaded.",
+                . 'could not be reloaded.',
             );
         }
 
@@ -397,25 +238,7 @@ class SyncFacebookCommentsJob implements ShouldQueue
             return;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Initialize Pipeline
-        |--------------------------------------------------------------------------
-        |
-        | The controller creates the SyncRun as QUEUED.
-        *
-        * The worker owns the transition:
-        *
-        *     QUEUED -> RUNNING
-        *
-        * and then initializes the asynchronous pipeline.
-        */
-
-        if (
-            ! $syncRunService->isPipelineInitialized(
-                $syncRun,
-            )
-        ) {
+        if (! $syncRunService->isPipelineInitialized($syncRun)) {
             $syncRun = $syncRunService->initializePipeline(
                 runId: (string) $syncRun->id,
             );
@@ -423,44 +246,13 @@ class SyncFacebookCommentsJob implements ShouldQueue
             Log::info(
                 'Facebook comment synchronization pipeline initialized.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post->id,
+                    'facebook_post_id' => $post->facebook_post_id,
+                    'facebook_page_id' => $page->facebook_page_id,
+                    'job_id' => $this->job?->getJobId(),
                 ],
             );
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Cancellation Check After Pipeline Initialization
-        |--------------------------------------------------------------------------
-        */
-
-        $syncRun = $this->reloadSyncRun(
-            $syncRun->id,
-            $page->id,
-        );
-
-        if ($syncRun === null) {
-            throw new RuntimeException(
-                "Facebook synchronization run '{$syncRunId}' "
-                . "could not be reloaded.",
-            );
-        }
-
-        if ($this->shouldStop($syncRun)) {
-            return;
         }
 
         /*
@@ -477,21 +269,15 @@ class SyncFacebookCommentsJob implements ShouldQueue
             );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Cancellation Check Before Meta API
-        |--------------------------------------------------------------------------
-        */
-
         $syncRun = $this->reloadSyncRun(
-            $syncRun->id,
-            $page->id,
+            (string) $syncRun->id,
+            (string) $page->id,
         );
 
         if ($syncRun === null) {
             throw new RuntimeException(
                 "Facebook synchronization run '{$syncRunId}' "
-                . "could not be reloaded.",
+                . 'could not be reloaded.',
             );
         }
 
@@ -501,26 +287,17 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
         /*
         |--------------------------------------------------------------------------
-        | Facebook Synchronization Switch
+        | Check Synchronization Settings
         |--------------------------------------------------------------------------
         */
 
-        if (! $settings->facebook_sync_enabled) {
+        if (! (bool) $settings->facebook_sync_enabled) {
             Log::info(
-                'Facebook comment synchronization skipped because '
-                . 'Facebook synchronization is disabled.',
+                'Comment synchronization skipped: Facebook synchronization disabled.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post->id,
+                    'facebook_post_id' => $post->facebook_post_id,
                 ],
             );
 
@@ -532,28 +309,13 @@ class SyncFacebookCommentsJob implements ShouldQueue
             return;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Facebook Comment Synchronization Switch
-        |--------------------------------------------------------------------------
-        */
-
-        if (! $settings->facebook_comments_enabled) {
+        if (! (bool) $settings->facebook_comments_enabled) {
             Log::info(
-                'Facebook comment synchronization skipped because '
-                . 'Facebook comment synchronization is disabled.',
+                'Comment synchronization skipped: comment synchronization disabled.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post->id,
+                    'facebook_post_id' => $post->facebook_post_id,
                 ],
             );
 
@@ -564,29 +326,15 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
             return;
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Facebook Page Monitoring Switch
-        |--------------------------------------------------------------------------
-        */
 
         if (! $page->is_active) {
             Log::info(
-                'Facebook comment synchronization skipped because '
-                . 'Page monitoring is disabled.',
+                'Comment synchronization skipped: Facebook page is inactive.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post->id,
+                    'facebook_post_id' => $post->facebook_post_id,
+                    'facebook_page_id' => $page->facebook_page_id,
                 ],
             );
 
@@ -600,19 +348,19 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
         /*
         |--------------------------------------------------------------------------
-        | Final Cancellation Check Before Meta Synchronization
+        | Final Cancellation Check Before Meta API
         |--------------------------------------------------------------------------
         */
 
         $syncRun = $this->reloadSyncRun(
-            $syncRun->id,
-            $page->id,
+            (string) $syncRun->id,
+            (string) $page->id,
         );
 
         if ($syncRun === null) {
             throw new RuntimeException(
                 "Facebook synchronization run '{$syncRunId}' "
-                . "could not be reloaded.",
+                . 'could not be reloaded before Meta synchronization.',
             );
         }
 
@@ -624,119 +372,144 @@ class SyncFacebookCommentsJob implements ShouldQueue
         |--------------------------------------------------------------------------
         | Synchronize Comments
         |--------------------------------------------------------------------------
+        |
+        | FacebookCommentSyncService::sync() must return:
+        |
+        | [
+        |     'comment_ids' => [...local comment UUIDs...],
+        |     'statistics' => [
+        |         'comments_fetched' => 10,
+        |         'comments_created' => 3,
+        |         'comments_updated' => 2,
+        |     ],
+        |     'pages_processed' => 1,
+        | ]
+        |
+        | comment_ids must contain local database UUIDs, not Meta IDs.
         */
 
         Log::info(
             'Starting Facebook comment synchronization from Meta.',
             [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'facebook_page_id' =>
-                    $page->facebook_page_id,
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
+                'sync_run_id' => $syncRun->id,
+                'post_internal_id' => $post->id,
+                'facebook_post_id' => $post->facebook_post_id,
+                'facebook_page_id' => $page->facebook_page_id,
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
             ],
         );
 
-        $commentIds = $commentSyncService->sync($post);
+        $syncResult = $commentSyncService->sync($post);
 
-        /*
-        |--------------------------------------------------------------------------
-        | Reload SyncRun After External Meta Operation
-        |--------------------------------------------------------------------------
-        |
-        | The Meta request can take some time.
-        *
-        * The user could cancel the run while the external request
-        * was executing.
-        *
-        * We cannot undo the Meta request, but we can prevent any
-        * downstream AI work or pipeline completion after cancellation.
-        */
-
-        $syncRun = $this->reloadSyncRun(
-            $syncRun->id,
-            $page->id,
-        );
-
-        if ($syncRun === null) {
+        if (! is_array($syncResult)) {
             throw new RuntimeException(
-                "Facebook synchronization run '{$syncRunId}' "
-                . "could not be reloaded after Meta synchronization.",
+                'FacebookCommentSyncService::sync() must return an array.',
             );
-        }
-
-        if ($this->shouldStop($syncRun)) {
-            Log::warning(
-                'Facebook comment synchronization stopped after Meta '
-                . 'synchronization because the SyncRun was cancelled.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-                ],
-            );
-
-            return;
         }
 
         /*
         |--------------------------------------------------------------------------
-        | Normalize AI Comment IDs
+        | Normalize Structured Service Result
         |--------------------------------------------------------------------------
         */
 
         $commentIds = $this->normalizeCommentIds(
-            $commentIds,
+            $syncResult['comment_ids'] ?? [],
+        );
+
+        $statistics = is_array($syncResult['statistics'] ?? null)
+            ? $syncResult['statistics']
+            : [];
+
+        $commentsFetched = max(
+            0,
+            (int) ($statistics['comments_fetched'] ?? 0),
+        );
+
+        $commentsCreated = max(
+            0,
+            (int) ($statistics['comments_created'] ?? 0),
+        );
+
+        $commentsUpdated = max(
+            0,
+            (int) ($statistics['comments_updated'] ?? 0),
+        );
+
+        $pagesProcessed = max(
+            0,
+            (int) ($syncResult['pages_processed'] ?? 0),
         );
 
         Log::info(
             'Facebook comment synchronization from Meta completed.',
             [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'facebook_page_id' =>
-                    $page->facebook_page_id,
-
-                'comments_for_analysis' =>
-                    count($commentIds),
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
+                'sync_run_id' => $syncRun->id,
+                'post_internal_id' => $post->id,
+                'facebook_post_id' => $post->facebook_post_id,
+                'facebook_page_id' => $page->facebook_page_id,
+                'comments_fetched' => $commentsFetched,
+                'comments_created' => $commentsCreated,
+                'comments_updated' => $commentsUpdated,
+                'comments_for_analysis' => count($commentIds),
+                'pages_processed' => $pagesProcessed,
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
             ],
         );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Record Synchronization Statistics Exactly Once
+        |--------------------------------------------------------------------------
+        |
+        | incrementStatisticsOnce() must atomically check its operation key,
+        | update the counters, and persist the operation key.
+        */
+
+        $syncRunService->incrementStatisticsOnce(
+            runId: (string) $syncRun->id,
+            operationKey: $this->commentStatisticsOperationKey(),
+            statistics: [
+                'comments_fetched' => $commentsFetched,
+                'comments_created' => $commentsCreated,
+                'comments_updated' => $commentsUpdated,
+            ],
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Reload SyncRun After Meta Synchronization
+        |--------------------------------------------------------------------------
+        */
+
+        $syncRun = $this->reloadSyncRun(
+            (string) $syncRun->id,
+            (string) $page->id,
+        );
+
+        if ($syncRun === null) {
+            throw new RuntimeException(
+                "Facebook synchronization run '{$syncRunId}' "
+                . 'could not be reloaded after Meta synchronization.',
+            );
+        }
+
+        if ($this->shouldStop($syncRun)) {
+            Log::warning(
+                'Comment synchronization stopped after Meta synchronization '
+                . 'because the SyncRun is terminal.',
+                [
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post->id,
+                    'facebook_post_id' => $post->facebook_post_id,
+                    'job_id' => $this->job?->getJobId(),
+                ],
+            );
+
+            return;
+        }
 
         /*
         |--------------------------------------------------------------------------
@@ -746,45 +519,16 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
         if ($commentIds === []) {
             Log::info(
-                'Facebook comments synchronized successfully. '
-                . 'No comments require AI analysis.',
+                'Facebook comments synchronized; no comments require AI analysis.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
-
-                    'comments_for_analysis' =>
-                        0,
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post->id,
+                    'facebook_post_id' => $post->facebook_post_id,
+                    'comments_fetched' => $commentsFetched,
+                    'comments_created' => $commentsCreated,
+                    'comments_updated' => $commentsUpdated,
                 ],
             );
-
-            /*
-             * Re-check cancellation immediately before modifying
-             * pipeline state.
-             */
-            $syncRun = $this->reloadSyncRun(
-                $syncRun->id,
-                $page->id,
-            );
-
-            if ($syncRun === null) {
-                throw new RuntimeException(
-                    "Facebook synchronization run '{$syncRunId}' "
-                    . "could not be reloaded.",
-                );
-            }
-
-            if ($this->shouldStop($syncRun)) {
-                return;
-            }
 
             $this->completeCommentSyncPipeline(
                 syncRunService: $syncRunService,
@@ -796,7 +540,7 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
         /*
         |--------------------------------------------------------------------------
-        | Determine Whether Automatic AI Analysis Is Enabled
+        | Automatic AI Analysis Settings
         |--------------------------------------------------------------------------
         */
 
@@ -804,59 +548,18 @@ class SyncFacebookCommentsJob implements ShouldQueue
             (bool) $settings->ai_enabled
             && (bool) $settings->ai_automatic_analysis;
 
-        /*
-        |--------------------------------------------------------------------------
-        | Automatic AI Disabled
-        |--------------------------------------------------------------------------
-        */
-
         if (! $automaticAiAnalysis) {
             Log::info(
-                'Facebook comments synchronized, but automatic AI '
-                . 'analysis was not dispatched.',
+                'Facebook comments synchronized, but automatic AI analysis is disabled.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
-
-                    'comments_for_analysis' =>
-                        count($commentIds),
-
-                    'ai_enabled' =>
-                        (bool) $settings->ai_enabled,
-
-                    'ai_automatic_analysis' =>
-                        (bool) $settings->ai_automatic_analysis,
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post->id,
+                    'facebook_post_id' => $post->facebook_post_id,
+                    'comments_for_analysis' => count($commentIds),
+                    'ai_enabled' => (bool) $settings->ai_enabled,
+                    'ai_automatic_analysis' => (bool) $settings->ai_automatic_analysis,
                 ],
             );
-
-            /*
-             * Re-check cancellation before marking the logical
-             * comment synchronization operation complete.
-             */
-            $syncRun = $this->reloadSyncRun(
-                $syncRun->id,
-                $page->id,
-            );
-
-            if ($syncRun === null) {
-                throw new RuntimeException(
-                    "Facebook synchronization run '{$syncRunId}' "
-                    . "could not be reloaded.",
-                );
-            }
-
-            if ($this->shouldStop($syncRun)) {
-                return;
-            }
 
             $this->completeCommentSyncPipeline(
                 syncRunService: $syncRunService,
@@ -868,100 +571,28 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
         /*
         |--------------------------------------------------------------------------
-        | Final Cancellation Check Before AI Dispatch
+        | Register Expected AI Job Before Dispatch
         |--------------------------------------------------------------------------
+        |
+        | Register before dispatch to avoid a race where a fast AI worker
+        | completes before the parent pipeline records the expected job.
         */
 
         $syncRun = $this->reloadSyncRun(
-            $syncRun->id,
-            $page->id,
+            (string) $syncRun->id,
+            (string) $page->id,
         );
 
         if ($syncRun === null) {
             throw new RuntimeException(
                 "Facebook synchronization run '{$syncRunId}' "
-                . "could not be reloaded.",
+                . 'could not be reloaded before AI dispatch.',
             );
         }
 
         if ($this->shouldStop($syncRun)) {
             return;
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Dispatch Comment AI Analysis
-        |--------------------------------------------------------------------------
-        */
-
-        Log::info(
-            'Dispatching Facebook comment AI analysis job.',
-            [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'facebook_page_id' =>
-                    $page->facebook_page_id,
-
-                'comment_count' =>
-                    count($commentIds),
-
-                'ai_queue' =>
-                    'facebook-ai',
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
-            ],
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Dispatch AI Job
-        |--------------------------------------------------------------------------
-        */
-
-        AnalyzeFacebookCommentsJob::dispatch(
-            commentIds: $commentIds,
-            syncRunId: (string) $syncRun->id,
-        )->onQueue('facebook-ai');
-
-        Log::info(
-            'Facebook comment AI analysis job dispatched successfully.',
-            [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'facebook_page_id' =>
-                    $page->facebook_page_id,
-
-                'comment_count' =>
-                    count($commentIds),
-
-                'ai_queue' =>
-                    'facebook-ai',
-            ],
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Register Expected Comment AI Job
-        |--------------------------------------------------------------------------
-        */
 
         $aiRegistration = $syncRunService->incrementPipelineOnce(
             runId: (string) $syncRun->id,
@@ -974,167 +605,130 @@ class SyncFacebookCommentsJob implements ShouldQueue
         Log::info(
             'Facebook comment AI pipeline expectation registered.',
             [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'comment_ai_operation_key' =>
-                    $this->commentAiRegistrationOperationKey(),
-
-                'counter_applied' =>
-                    $aiRegistration['applied'],
-
-                'comment_ai_jobs_expected_increment' =>
-                    $aiRegistration['applied']
-                        ? 1
-                        : 0,
+                'sync_run_id' => $syncRun->id,
+                'post_internal_id' => $post->id,
+                'comment_ai_operation_key' => $this->commentAiRegistrationOperationKey(),
+                'counter_applied' => $aiRegistration['applied'] ?? false,
+                'comments_for_analysis' => count($commentIds),
             ],
         );
 
         /*
         |--------------------------------------------------------------------------
-        | Update AI Queue Statistics
+        | Record AI Queue Statistics Exactly Once
         |--------------------------------------------------------------------------
         */
 
-        if ($aiRegistration['applied']) {
-            $syncRunService->incrementStatistics(
-                runId: (string) $syncRun->id,
-                statistics: [
-                    'comments_queued_for_ai' =>
-                        count($commentIds),
-                ],
-            );
-
-            Log::info(
-                'Facebook comment AI queue statistics updated.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'comments_queued_for_ai' =>
-                        count($commentIds),
-                ],
-            );
-        } else {
-            Log::info(
-                'Facebook comment AI queue statistics were not '
-                . 'incremented because the AI registration operation '
-                . 'was already recorded.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'comment_ai_operation_key' =>
-                        $this->commentAiRegistrationOperationKey(),
-                ],
-            );
-        }
+        $syncRunService->incrementStatisticsOnce(
+            runId: (string) $syncRun->id,
+            operationKey: $this->commentAiStatisticsOperationKey(),
+            statistics: [
+                'comments_queued_for_ai' => count($commentIds),
+            ],
+        );
 
         /*
         |--------------------------------------------------------------------------
-        | Check Cancellation Before Final Pipeline Update
+        | Final Cancellation Check Before Dispatch
         |--------------------------------------------------------------------------
-        |
-        | Cancellation could have happened while the AI job was being
-        | dispatched/registered.
-        *
-        * If cancellation already happened, pipeline writes will be
-        * rejected by the service because CANCELLED is terminal.
         */
 
         $syncRun = $this->reloadSyncRun(
-            $syncRun->id,
-            $page->id,
+            (string) $syncRun->id,
+            (string) $page->id,
         );
 
         if ($syncRun === null) {
             throw new RuntimeException(
                 "Facebook synchronization run '{$syncRunId}' "
-                . "could not be reloaded.",
+                . 'could not be reloaded before AI dispatch.',
             );
         }
 
         if ($this->shouldStop($syncRun)) {
-            Log::warning(
-                'Facebook comment synchronization detected cancellation '
-                . 'after AI dispatch.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post->id,
-
-                    'facebook_post_id' =>
-                        $post->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $page->facebook_page_id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-                ],
-            );
-
             return;
         }
 
         /*
         |--------------------------------------------------------------------------
-        | Mark Comment Synchronization Job Completed Exactly Once
+        | Dispatch AI Analysis
+        |--------------------------------------------------------------------------
+        |
+        | AnalyzeFacebookCommentsJob should be idempotent because a retry
+        | may publish a duplicate queue message.
+        */
+
+        Log::info(
+            'Dispatching Facebook comment AI analysis job.',
+            [
+                'sync_run_id' => $syncRun->id,
+                'post_internal_id' => $post->id,
+                'facebook_post_id' => $post->facebook_post_id,
+                'facebook_page_id' => $page->facebook_page_id,
+                'comment_count' => count($commentIds),
+                'ai_queue' => 'facebook-ai',
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
+            ],
+        );
+
+        AnalyzeFacebookCommentsJob::dispatch(
+            commentIds: $commentIds,
+            syncRunId: (string) $syncRun->id,
+        )->onQueue('facebook-ai');
+
+        Log::info(
+            'Facebook comment AI analysis job dispatched.',
+            [
+                'sync_run_id' => $syncRun->id,
+                'post_internal_id' => $post->id,
+                'facebook_post_id' => $post->facebook_post_id,
+                'comment_count' => count($commentIds),
+                'ai_queue' => 'facebook-ai',
+            ],
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Mark Comment Pipeline Job Completed
         |--------------------------------------------------------------------------
         */
+
+        $syncRun = $this->reloadSyncRun(
+            (string) $syncRun->id,
+            (string) $page->id,
+        );
+
+        if ($syncRun === null) {
+            throw new RuntimeException(
+                "Facebook synchronization run '{$syncRunId}' "
+                . 'could not be reloaded after AI dispatch.',
+            );
+        }
+
+        if ($this->shouldStop($syncRun)) {
+            return;
+        }
 
         $this->completeCommentSyncPipeline(
             syncRunService: $syncRunService,
             syncRunId: (string) $syncRun->id,
         );
 
-        /*
-        |--------------------------------------------------------------------------
-        | Final Logging
-        |--------------------------------------------------------------------------
-        */
-
         Log::info(
-            'Facebook comments synchronized and AI analysis '
-            . 'pipeline registered successfully.',
+            'Facebook comment synchronization pipeline registered successfully.',
             [
-                'sync_run_id' =>
-                    $syncRun->id,
-
-                'post_internal_id' =>
-                    $post->id,
-
-                'facebook_post_id' =>
-                    $post->facebook_post_id,
-
-                'facebook_page_id' =>
-                    $page->facebook_page_id,
-
-                'comments_for_analysis' =>
-                    count($commentIds),
-
-                'comment_ai_jobs_dispatched' =>
-                    1,
-
-                'comment_ai_registration_applied' =>
-                    $aiRegistration['applied'],
-
-                'ai_queue' =>
-                    'facebook-ai',
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
+                'sync_run_id' => $syncRun->id,
+                'post_internal_id' => $post->id,
+                'facebook_post_id' => $post->facebook_post_id,
+                'comments_fetched' => $commentsFetched,
+                'comments_created' => $commentsCreated,
+                'comments_updated' => $commentsUpdated,
+                'comments_for_analysis' => count($commentIds),
+                'comment_ai_jobs_dispatched' => 1,
+                'ai_queue' => 'facebook-ai',
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
             ],
         );
     }
@@ -1145,57 +739,23 @@ class SyncFacebookCommentsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Mark this logical comment synchronization operation as
-     * completed exactly once and attempt full pipeline completion.
-     */
     private function completeCommentSyncPipeline(
         FacebookSyncRunService $syncRunService,
         string $syncRunId,
     ): void {
-        /*
-        |--------------------------------------------------------------------------
-        | Check SyncRun Before Pipeline Mutation
-        |--------------------------------------------------------------------------
-        */
-
         $syncRun = FacebookSyncRun::query()
             ->find($syncRunId);
 
         if ($syncRun === null) {
             throw new RuntimeException(
                 "Facebook synchronization run '{$syncRunId}' "
-                . "was not found while completing comment synchronization.",
+                . 'was not found while completing comment synchronization.',
             );
         }
 
         if ($this->shouldStop($syncRun)) {
-            Log::warning(
-                'Facebook comment synchronization pipeline completion '
-                . 'was skipped because the SyncRun is terminal.',
-                [
-                    'sync_run_id' =>
-                        $syncRunId,
-
-                    'sync_run_status' =>
-                        $this->syncRunStatus($syncRun),
-
-                    'pipeline_operation_key' =>
-                        $this->pipelineOperationKey(),
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-                ],
-            );
-
             return;
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Mark Comment Job Completed Exactly Once
-        |--------------------------------------------------------------------------
-        */
 
         $result = $syncRunService->markPipelineJobCompletedOnce(
             runId: $syncRunId,
@@ -1206,109 +766,82 @@ class SyncFacebookCommentsJob implements ShouldQueue
         );
 
         Log::info(
-            'Facebook comment synchronization pipeline completion '
-            . 'recorded.',
+            'Facebook comment synchronization pipeline completion recorded.',
             [
-                'sync_run_id' =>
-                    $syncRunId,
-
-                'pipeline_operation_key' =>
-                    $this->pipelineOperationKey(),
-
-                'counter_applied' =>
-                    $result['applied'],
-
-                'comment_jobs_completed_increment' =>
-                    $result['applied']
-                        ? 1
-                        : 0,
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempt' =>
-                    $this->attempts(),
+                'sync_run_id' => $syncRunId,
+                'pipeline_operation_key' => $this->pipelineOperationKey(),
+                'counter_applied' => $result['applied'] ?? false,
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
             ],
         );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Attempt Full Pipeline Completion
-        |--------------------------------------------------------------------------
-        */
 
         $completedRun = $syncRunService->completePipelineIfReady(
             runId: $syncRunId,
         );
 
         Log::info(
-            'Facebook comment synchronization pipeline completion '
-            . 'check finished.',
+            'Facebook comment synchronization pipeline completion check finished.',
             [
-                'sync_run_id' =>
-                    $syncRunId,
-
-                'sync_run_status' =>
-                    $this->syncRunStatus($completedRun),
-
-                'pipeline_completed' =>
-                    $this->pipelineCompleted($completedRun),
-
-                'job_id' =>
-                    $this->job?->getJobId(),
+                'sync_run_id' => $syncRunId,
+                'sync_run_status' => $this->syncRunStatus($completedRun),
+                'pipeline_completed' => $this->pipelineCompleted($completedRun),
+                'job_id' => $this->job?->getJobId(),
             ],
         );
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Pipeline Operation Keys
+    | Operation Keys
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Deterministic operation key for this logical comment-sync job.
-     */
     private function pipelineOperationKey(): string
     {
         return 'comment-sync:'
             . $this->syncRunId
             . ':'
-            . hash(
-                'sha256',
-                $this->postId,
-            );
+            . hash('sha256', $this->postId);
     }
 
-    /**
-     * Deterministic operation key for registering the downstream
-     * comment AI job expectation.
-     */
+    private function commentStatisticsOperationKey(): string
+    {
+        return 'comment-sync-statistics:'
+            . $this->syncRunId
+            . ':'
+            . hash('sha256', $this->postId);
+    }
+
     private function commentAiRegistrationOperationKey(): string
     {
         return 'comment-ai-dispatch:'
             . $this->syncRunId
             . ':'
-            . hash(
-                'sha256',
-                $this->postId,
-            );
+            . hash('sha256', $this->postId);
+    }
+
+    private function commentAiStatisticsOperationKey(): string
+    {
+        return 'comment-ai-statistics:'
+            . $this->syncRunId
+            . ':'
+            . hash('sha256', $this->postId);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | ID Normalization
+    | Comment ID Normalization
     |--------------------------------------------------------------------------
     */
 
     /**
-     * Normalize internal FacebookComment UUIDs.
+     * Normalize local FacebookComment UUIDs.
      *
      * @return array<int, string>
      */
-    private function normalizeCommentIds(
-        mixed $commentIds,
-    ): array {
+    private function normalizeCommentIds(mixed $commentIds): array
+    {
         if (! is_array($commentIds)) {
             return [];
         }
@@ -1338,95 +871,38 @@ class SyncFacebookCommentsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Reload the SyncRun and ensure it belongs to the expected Page.
-     */
     private function reloadSyncRun(
         string $syncRunId,
         string $pageId,
     ): ?FacebookSyncRun {
         return FacebookSyncRun::query()
             ->whereKey($syncRunId)
-            ->where(
-                'facebook_page_id',
-                $pageId,
-            )
+            ->where('facebook_page_id', $pageId)
             ->first();
     }
 
-    /**
-     * Determine whether the job must stop processing.
-     *
-     * CANCELLED is explicitly handled here.
-     *
-     * COMPLETED and FAILED are also terminal and must not be
-     * processed again.
-     */
-    private function shouldStop(
-        FacebookSyncRun $syncRun,
-    ): bool {
-        if (
-            $syncRun->status
-            === FacebookSyncStatus::CANCELLED
-        ) {
-            Log::warning(
-                'Facebook comment synchronization job stopping because '
-                . 'the SyncRun was cancelled.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'sync_run_status' =>
-                        $this->syncRunStatus($syncRun),
-
-                    'post_internal_id' =>
-                        $this->postId,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempt' =>
-                        $this->attempts(),
-                ],
-            );
-
-            return true;
+    private function shouldStop(FacebookSyncRun $syncRun): bool
+    {
+        if (! $this->isTerminalSyncRun($syncRun)) {
+            return false;
         }
 
-        if ($this->isTerminalSyncRun($syncRun)) {
-            Log::warning(
-                'Facebook comment synchronization job stopping because '
-                . 'the SyncRun is terminal.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
+        Log::warning(
+            'Facebook comment synchronization stopped because the SyncRun is terminal.',
+            [
+                'sync_run_id' => $syncRun->id,
+                'sync_run_status' => $this->syncRunStatus($syncRun),
+                'post_internal_id' => $this->postId,
+                'job_id' => $this->job?->getJobId(),
+                'attempt' => $this->attempts(),
+            ],
+        );
 
-                    'sync_run_status' =>
-                        $this->syncRunStatus($syncRun),
-
-                    'post_internal_id' =>
-                        $this->postId,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempt' =>
-                        $this->attempts(),
-                ],
-            );
-
-            return true;
-        }
-
-        return false;
+        return true;
     }
 
-    /**
-     * Return the SyncRun status as a string.
-     */
-    private function syncRunStatus(
-        FacebookSyncRun $syncRun,
-    ): string {
+    private function syncRunStatus(FacebookSyncRun $syncRun): string
+    {
         $status = $syncRun->status;
 
         if ($status instanceof FacebookSyncStatus) {
@@ -1436,12 +912,8 @@ class SyncFacebookCommentsJob implements ShouldQueue
         return (string) $status;
     }
 
-    /**
-     * Determine whether the SyncRun is terminal.
-     */
-    private function isTerminalSyncRun(
-        FacebookSyncRun $syncRun,
-    ): bool {
+    private function isTerminalSyncRun(FacebookSyncRun $syncRun): bool
+    {
         $status = $syncRun->status;
 
         if ($status instanceof FacebookSyncStatus) {
@@ -1449,7 +921,7 @@ class SyncFacebookCommentsJob implements ShouldQueue
         }
 
         return in_array(
-            (string) $status,
+            strtolower((string) $status),
             [
                 'completed',
                 'failed',
@@ -1459,13 +931,8 @@ class SyncFacebookCommentsJob implements ShouldQueue
         );
     }
 
-    /**
-     * Safely determine whether the pipeline is marked completed
-     * in SyncRun metadata.
-     */
-    private function pipelineCompleted(
-        FacebookSyncRun $syncRun,
-    ): bool {
+    private function pipelineCompleted(FacebookSyncRun $syncRun): bool
+    {
         $metadata = $syncRun->metadata ?? [];
 
         if (! is_array($metadata)) {
@@ -1487,111 +954,57 @@ class SyncFacebookCommentsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Handle permanent failure after all retry attempts.
-     *
-     * A permanently failed comment synchronization operation
-     * increments comment_jobs_failed exactly once.
-     */
-    public function failed(
-        ?Throwable $exception,
-    ): void {
-        /*
-        |--------------------------------------------------------------------------
-        | Load Post
-        |--------------------------------------------------------------------------
-        */
-
+    public function failed(?Throwable $exception): void
+    {
         $postId = trim($this->postId);
         $syncRunId = trim($this->syncRunId);
 
-        $post = null;
-
-        if ($postId !== '') {
-            $post = FacebookPost::query()
+        $post = $postId !== ''
+            ? FacebookPost::query()
                 ->select([
                     'id',
                     'facebook_page_id',
                     'facebook_post_id',
                 ])
-                ->find($postId);
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Load SyncRun
-        |--------------------------------------------------------------------------
-        */
+                ->find($postId)
+            : null;
 
         if ($syncRunId === '') {
             Log::error(
-                'Facebook comment synchronization permanently failed '
-                . 'without a sync run ID.',
+                'Facebook comment synchronization permanently failed without a SyncRun ID.',
                 [
-                    'post_internal_id' =>
-                        $postId,
-
-                    'exception_class' =>
-                        $exception !== null
-                            ? $exception::class
-                            : null,
-
-                    'exception_message' =>
-                        $this->safeErrorMessage($exception),
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempts' =>
-                        $this->attempts(),
+                    'post_internal_id' => $postId,
+                    'exception_class' => $this->exceptionClass($exception),
+                    'exception_message' => $this->safeErrorMessage($exception),
+                    'job_id' => $this->job?->getJobId(),
+                    'attempts' => $this->attempts(),
                 ],
             );
 
             return;
         }
 
-        $syncRunQuery = FacebookSyncRun::query()
+        $query = FacebookSyncRun::query()
             ->whereKey($syncRunId);
 
         if ($post !== null) {
-            $syncRunQuery->where(
+            $query->where(
                 'facebook_page_id',
                 $post->facebook_page_id,
             );
         }
 
-        $syncRun = $syncRunQuery->first();
+        $syncRun = $query->first();
 
         if ($syncRun === null) {
             Log::error(
-                'Facebook comment synchronization permanently failed '
-                . 'because the SyncRun could not be found.',
+                'Facebook comment synchronization permanently failed: SyncRun not found.',
                 [
-                    'sync_run_id' =>
-                        $syncRunId,
-
-                    'post_internal_id' =>
-                        $post?->id ?? $postId,
-
-                    'facebook_post_id' =>
-                        $post?->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $post?->facebook_page_id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempts' =>
-                        $this->attempts(),
-
-                    'exception_class' =>
-                        $exception !== null
-                            ? $exception::class
-                            : null,
-
-                    'exception_message' =>
-                        $this->safeErrorMessage($exception),
+                    'sync_run_id' => $syncRunId,
+                    'post_internal_id' => $post?->id ?? $postId,
+                    'job_id' => $this->job?->getJobId(),
+                    'exception_class' => $this->exceptionClass($exception),
+                    'exception_message' => $this->safeErrorMessage($exception),
                 ],
             );
 
@@ -1599,49 +1012,18 @@ class SyncFacebookCommentsJob implements ShouldQueue
         }
 
         /*
-        |--------------------------------------------------------------------------
-        | If User Cancelled the Run
-        |--------------------------------------------------------------------------
-        |
-        | Cancellation is an intentional terminal state.
-        *
-        * Do NOT turn CANCELLED into FAILED.
-        */
-
-        if (
-            $syncRun->status
-            === FacebookSyncStatus::CANCELLED
-        ) {
+         * Never overwrite a terminal state, including CANCELLED.
+         */
+        if ($this->isTerminalSyncRun($syncRun)) {
             Log::warning(
                 'Facebook comment synchronization permanently failed '
-                . 'after the SyncRun was cancelled. The run remains '
-                . 'CANCELLED.',
+                . 'after the SyncRun became terminal; no terminal state changed.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post?->id ?? $postId,
-
-                    'facebook_post_id' =>
-                        $post?->facebook_post_id,
-
-                    'facebook_page_id' =>
-                        $post?->facebook_page_id,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempts' =>
-                        $this->attempts(),
-
-                    'exception_class' =>
-                        $exception !== null
-                            ? $exception::class
-                            : null,
-
-                    'exception_message' =>
-                        $this->safeErrorMessage($exception),
+                    'sync_run_id' => $syncRun->id,
+                    'sync_run_status' => $this->syncRunStatus($syncRun),
+                    'post_internal_id' => $post?->id ?? $postId,
+                    'job_id' => $this->job?->getJobId(),
+                    'attempts' => $this->attempts(),
                 ],
             );
 
@@ -1650,111 +1032,70 @@ class SyncFacebookCommentsJob implements ShouldQueue
 
         /*
         |--------------------------------------------------------------------------
-        | Record Failure in SyncRun Metadata
+        | Record Failure in Metadata
         |--------------------------------------------------------------------------
         */
 
         try {
-            $metadata = $syncRun->metadata ?? [];
+            $metadata = is_array($syncRun->metadata)
+                ? $syncRun->metadata
+                : [];
 
-            if (! is_array($metadata)) {
-                $metadata = [];
+            $failures = is_array($metadata['comment_sync_failures'] ?? null)
+                ? $metadata['comment_sync_failures']
+                : [];
+
+            $failedPostId = (string) ($post?->id ?? $postId);
+
+            $alreadyRecorded = collect($failures)->contains(
+                fn (mixed $failure): bool =>
+                    is_array($failure)
+                    && (string) ($failure['post_internal_id'] ?? '') === $failedPostId,
+            );
+
+            if (! $alreadyRecorded) {
+                $failures[] = [
+                    'post_internal_id' => $post?->id ?? $postId,
+                    'facebook_post_id' => $post?->facebook_post_id,
+                    'job_id' => $this->job?->getJobId(),
+                    'attempts' => $this->attempts(),
+                    'exception_class' => $this->exceptionClass($exception),
+                    'error' => $this->safeErrorMessage($exception),
+                    'failed_at' => now()->toISOString(),
+                ];
             }
 
-            $commentFailures =
-                $metadata['comment_sync_failures'] ?? [];
-
-            if (! is_array($commentFailures)) {
-                $commentFailures = [];
-            }
-
-            $commentFailures[] = [
-                'post_internal_id' =>
-                    $post?->id ?? $postId,
-
-                'facebook_post_id' =>
-                    $post?->facebook_post_id,
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempts' =>
-                    $this->attempts(),
-
-                'error' =>
-                    $this->safeErrorMessage($exception),
-
-                'failed_at' =>
-                    now()->toISOString(),
-            ];
-
-            /*
-             * Keep only the latest 100 failures.
-             */
-            $commentFailures = array_slice(
-                $commentFailures,
+            $metadata['comment_sync_failures'] = array_slice(
+                $failures,
                 -100,
             );
 
             $syncRun->forceFill([
-                'metadata' => array_merge(
-                    $metadata,
-                    [
-                        'comment_sync_failures' =>
-                            $commentFailures,
-                    ],
-                ),
+                'metadata' => $metadata,
             ])->save();
-
-            Log::warning(
-                'Facebook comment synchronization failure '
-                . 'recorded in SyncRun metadata.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post?->id ?? $postId,
-
-                    'facebook_post_id' =>
-                        $post?->facebook_post_id,
-
-                    'attempts' =>
-                        $this->attempts(),
-                ],
-            );
         } catch (Throwable $metadataException) {
             Log::error(
-                'Failed to record Facebook comment synchronization '
-                . 'failure in SyncRun metadata.',
+                'Failed to record comment synchronization failure metadata.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post?->id ?? $postId,
-
-                    'metadata_exception_class' =>
-                        $metadataException::class,
-
-                    'metadata_exception_message' =>
-                        $this->safeErrorMessage(
-                            $metadataException,
-                        ),
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post?->id ?? $postId,
+                    'exception_class' => $metadataException::class,
+                    'exception_message' => $this->safeErrorMessage(
+                        $metadataException,
+                    ),
                 ],
             );
         }
 
         /*
         |--------------------------------------------------------------------------
-        | Mark Comment Pipeline Operation Failed Exactly Once
+        | Mark Pipeline Failure Exactly Once
         |--------------------------------------------------------------------------
         */
 
         try {
-            $syncRunService = app(
-                FacebookSyncRunService::class,
-            );
+            /** @var FacebookSyncRunService $syncRunService */
+            $syncRunService = app(FacebookSyncRunService::class);
 
             $result = $syncRunService->markPipelineJobCompletedOnce(
                 runId: (string) $syncRun->id,
@@ -1764,134 +1105,70 @@ class SyncFacebookCommentsJob implements ShouldQueue
                 ],
             );
 
-            Log::warning(
-                'Facebook comment synchronization permanent failure '
-                . 'pipeline result recorded.',
-                [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post?->id ?? $postId,
-
-                    'pipeline_operation_key' =>
-                        $this->pipelineOperationKey(),
-
-                    'counter_applied' =>
-                        $result['applied'],
-
-                    'comment_jobs_failed_increment' =>
-                        $result['applied']
-                            ? 1
-                            : 0,
-
-                    'job_id' =>
-                        $this->job?->getJobId(),
-
-                    'attempts' =>
-                        $this->attempts(),
-                ],
-            );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Check Full Pipeline Completion
-            |--------------------------------------------------------------------------
-            */
-
             $completedRun = $syncRunService->completePipelineIfReady(
                 runId: (string) $syncRun->id,
             );
 
-            Log::info(
-                'Facebook comment synchronization permanent failure '
-                . 'pipeline completion check finished.',
+            Log::warning(
+                'Facebook comment synchronization failure recorded in pipeline.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'sync_run_status' =>
-                        $this->syncRunStatus($completedRun),
-
-                    'pipeline_completed' =>
-                        $this->pipelineCompleted($completedRun),
-
-                    'post_internal_id' =>
-                        $post?->id ?? $postId,
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post?->id ?? $postId,
+                    'pipeline_operation_key' => $this->pipelineOperationKey(),
+                    'counter_applied' => $result['applied'] ?? false,
+                    'sync_run_status' => $this->syncRunStatus($completedRun),
+                    'pipeline_completed' => $this->pipelineCompleted($completedRun),
+                    'attempts' => $this->attempts(),
+                    'exception_class' => $this->exceptionClass($exception),
+                    'exception_message' => $this->safeErrorMessage($exception),
                 ],
             );
         } catch (Throwable $pipelineException) {
             Log::error(
-                'Failed to update Facebook SyncRun pipeline '
-                . 'after permanent comment synchronization failure.',
+                'Failed to update SyncRun pipeline after permanent comment synchronization failure.',
                 [
-                    'sync_run_id' =>
-                        $syncRun->id,
-
-                    'post_internal_id' =>
-                        $post?->id ?? $postId,
-
-                    'pipeline_operation_key' =>
-                        $this->pipelineOperationKey(),
-
-                    'pipeline_exception_class' =>
-                        $pipelineException::class,
-
-                    'pipeline_exception_message' =>
-                        $this->safeErrorMessage(
-                            $pipelineException,
-                        ),
-
-                    'original_exception_class' =>
-                        $exception !== null
-                            ? $exception::class
-                            : null,
-
-                    'original_exception_message' =>
-                        $this->safeErrorMessage($exception),
+                    'sync_run_id' => $syncRun->id,
+                    'post_internal_id' => $post?->id ?? $postId,
+                    'pipeline_operation_key' => $this->pipelineOperationKey(),
+                    'pipeline_exception_class' => $pipelineException::class,
+                    'pipeline_exception_message' => $this->safeErrorMessage(
+                        $pipelineException,
+                    ),
+                    'original_exception_class' => $this->exceptionClass($exception),
+                    'original_exception_message' => $this->safeErrorMessage(
+                        $exception,
+                    ),
                 ],
             );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Permanent Failure Log
-        |--------------------------------------------------------------------------
-        */
-
         Log::error(
             'Facebook comment synchronization job failed permanently.',
             [
-                'sync_run_id' =>
-                    $syncRunId,
-
-                'post_internal_id' =>
-                    $post?->id ?? $postId,
-
-                'facebook_post_id' =>
-                    $post?->facebook_post_id,
-
-                'facebook_page_id' =>
-                    $post?->facebook_page_id,
-
-                'pipeline_operation_key' =>
-                    $this->pipelineOperationKey(),
-
-                'job_id' =>
-                    $this->job?->getJobId(),
-
-                'attempts' =>
-                    $this->attempts(),
-
-                'exception_class' =>
-                    $exception !== null
-                        ? $exception::class
-                        : null,
-
-                'exception_message' =>
-                    $this->safeErrorMessage($exception),
+                'sync_run_id' => $syncRunId,
+                'post_internal_id' => $post?->id ?? $postId,
+                'facebook_post_id' => $post?->facebook_post_id,
+                'facebook_page_id' => $post?->facebook_page_id,
+                'pipeline_operation_key' => $this->pipelineOperationKey(),
+                'job_id' => $this->job?->getJobId(),
+                'attempts' => $this->attempts(),
+                'exception_class' => $this->exceptionClass($exception),
+                'exception_message' => $this->safeErrorMessage($exception),
             ],
         );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Exception Helpers
+    |--------------------------------------------------------------------------
+    */
+
+    private function exceptionClass(?Throwable $exception): ?string
+    {
+        return $exception === null
+            ? null
+            : $exception::class;
     }
 
     /*
@@ -1900,42 +1177,30 @@ class SyncFacebookCommentsJob implements ShouldQueue
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Return a safe error message.
-     */
-    private function safeErrorMessage(
-        ?Throwable $exception,
-    ): ?string {
+    private function safeErrorMessage(?Throwable $exception): ?string
+    {
         if ($exception === null) {
             return null;
         }
 
-        $message = trim(
-            $exception->getMessage(),
-        );
+        $message = trim($exception->getMessage());
 
         if ($message === '') {
-            return $exception::class;
+            return $this->exceptionClass($exception);
         }
 
         /*
-        |--------------------------------------------------------------------------
-        | Remove Sensitive Query Parameters
-        |--------------------------------------------------------------------------
-        */
-
+         * Redact token-bearing query parameters.
+         */
         $message = preg_replace(
-            '/([?&](?:access_token|appsecret_proof)=)[^&\s]*/i',
+            '/([?&](?:access_token|appsecret_proof|token|api_key|apikey|secret)=)[^&\s]*/i',
             '$1[REDACTED]',
             $message,
         ) ?? $message;
 
         /*
-        |--------------------------------------------------------------------------
-        | Remove Bearer Tokens
-        |--------------------------------------------------------------------------
-        */
-
+         * Redact bearer credentials.
+         */
         $message = preg_replace(
             '/(Bearer\s+)[A-Za-z0-9._~+\/=-]+/i',
             '$1[REDACTED]',
@@ -1943,27 +1208,14 @@ class SyncFacebookCommentsJob implements ShouldQueue
         ) ?? $message;
 
         /*
-        |--------------------------------------------------------------------------
-        | Remove Common Token-like Query Values
-        |--------------------------------------------------------------------------
-        */
-
+         * Redact common key/value credential patterns.
+         */
         $message = preg_replace(
-            '/((?:access_token|appsecret_proof|token|api_key|apikey|secret)=)[^&\s]*/i',
+            '/((?:access_token|appsecret_proof|token|api_key|apikey|password|secret|authorization)\s*[:=]\s*)[^\s&,;]+/i',
             '$1[REDACTED]',
             $message,
         ) ?? $message;
 
-        /*
-        |--------------------------------------------------------------------------
-        | Limit Error Size
-        |--------------------------------------------------------------------------
-        */
-
-        return mb_substr(
-            $message,
-            0,
-            5000,
-        );
+        return mb_substr($message, 0, 5000);
     }
 }

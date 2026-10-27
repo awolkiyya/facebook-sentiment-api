@@ -166,9 +166,8 @@ final class FacebookSyncRunService
     /**
      * Mark a queued run as running.
      *
-     * A queue redelivery may encounter a run that is already running.
-     * Such a redelivery refreshes the heartbeat but does not increment
-     * the run attempt count again.
+     * A redelivery encountering an already-running run refreshes its
+     * heartbeat without incrementing attempts a second time.
      */
     public function markRunning(
         string $runId,
@@ -226,11 +225,6 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Record activity for a running synchronization.
-     *
-     * Workers should call this periodically during long-running work.
-     */
     public function heartbeat(string $runId): FacebookSyncRun
     {
         return DB::transaction(function () use (
@@ -262,12 +256,6 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Cancel a queued or running synchronization.
-     *
-     * The queue worker must check the run status before starting
-     * additional work. This method does not itself terminate a worker.
-     */
     public function cancel(
         FacebookSyncRun $run,
         ?object $user = null,
@@ -307,8 +295,6 @@ final class FacebookSyncRunService
 
             $lockedRun->metadata = $metadata;
             $lockedRun->status = FacebookSyncStatus::CANCELLED;
-
-            // Cancellation is terminal, but not successful completion.
             $lockedRun->completed_at = null;
             $lockedRun->finished_at = $now;
             $lockedRun->last_heartbeat_at = $now;
@@ -327,13 +313,6 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Prepare a failed or cancelled run for retry.
-     *
-     * This method does not dispatch a queue job. The orchestration
-     * layer must dispatch the correct root job after this transaction
-     * succeeds.
-     */
     public function retry(
         FacebookSyncRun $run,
         ?object $user = null,
@@ -343,11 +322,7 @@ final class FacebookSyncRunService
             $user,
         ): FacebookSyncRun {
             /*
-             * Establish a consistent lock order:
-             * Facebook Page first, then SyncRun.
-             *
-             * This reduces deadlock risk with create(), which also
-             * locks the Facebook Page before checking active runs.
+             * Consistent lock order: Facebook Page, then SyncRun.
              */
             /** @var FacebookSyncRun $initialRun */
             $initialRun = FacebookSyncRun::query()
@@ -372,7 +347,10 @@ final class FacebookSyncRunService
                 ->lockForUpdate()
                 ->findOrFail($run->getKey());
 
-            if ($lockedRun->facebook_page_id !== $page->getKey()) {
+            if (
+                (string) $lockedRun->facebook_page_id
+                !== (string) $page->getKey()
+            ) {
                 throw ValidationException::withMessages([
                     'facebook_page_id' => [
                         'The Facebook Page associated with this run has changed. Reload and try again.',
@@ -450,7 +428,11 @@ final class FacebookSyncRunService
             $metadata['retry_history'] = $retryHistory;
             $metadata['retry_count'] = count($retryHistory);
 
-            // Downstream pipeline state must be rebuilt for the new attempt.
+            /*
+             * Rebuild downstream state for the new attempt.
+             * Preserve historical statistics_operations so an old
+             * operation cannot be counted twice after a retry.
+             */
             unset($metadata['pipeline'], $metadata['cancellation']);
 
             $lockedRun->metadata = $metadata;
@@ -467,7 +449,7 @@ final class FacebookSyncRunService
             $lockedRun->error_message = null;
             $lockedRun->queued_at = $now;
 
-            // Attempts are incremented when the worker actually starts.
+            // Attempts are incremented when the worker starts.
             $lockedRun->save();
 
             return $lockedRun->refresh();
@@ -481,8 +463,6 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Initialize asynchronous pipeline tracking exactly once.
-     *
      * @param array<string, mixed> $counters
      */
     public function initializePipeline(
@@ -500,7 +480,6 @@ final class FacebookSyncRunService
 
             $this->assertPipelineWritable($run);
 
-            // Validate every supplied value before changing metadata.
             foreach ($counters as $key => $value) {
                 $this->validatePipelineCounter($key, $value);
             }
@@ -531,6 +510,7 @@ final class FacebookSyncRunService
             $pipeline['initialized'] = true;
             $pipeline['initialized_at'] = $now->toIso8601String();
             $pipeline['completed'] = false;
+
             unset($pipeline['completed_at']);
 
             $metadata['pipeline'] = $pipeline;
@@ -550,10 +530,6 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Increment pipeline counters.
-     *
-     * The row lock serializes read-modify-write updates to JSON metadata.
-     *
      * @param array<string, mixed> $counters
      */
     public function incrementPipeline(
@@ -604,6 +580,9 @@ final class FacebookSyncRunService
     /**
      * Increment pipeline counters once per operation key.
      *
+     * Note: operation history is bounded. For strict permanent
+     * idempotency, use a dedicated table with a unique constraint.
+     *
      * @param array<string, mixed> $counters
      * @return array{run: FacebookSyncRun, applied: bool}
      */
@@ -614,21 +593,7 @@ final class FacebookSyncRunService
     ): array {
         $operationKey = trim($operationKey);
 
-        if ($operationKey === '') {
-            throw ValidationException::withMessages([
-                'operation_key' => [
-                    'The pipeline operation key cannot be empty.',
-                ],
-            ]);
-        }
-
-        if (strlen($operationKey) > 255) {
-            throw ValidationException::withMessages([
-                'operation_key' => [
-                    'The pipeline operation key cannot exceed 255 characters.',
-                ],
-            ]);
-        }
+        $this->validateOperationKey($operationKey);
 
         return DB::transaction(function () use (
             $runId,
@@ -651,7 +616,6 @@ final class FacebookSyncRunService
                 : [];
 
             $pipeline = $this->getPipelineMetadata($metadata);
-
             $operations = $pipeline['operations'];
 
             if (isset($operations[$operationKey])) {
@@ -699,14 +663,6 @@ final class FacebookSyncRunService
     */
 
     /**
-     * Record downstream pipeline job outcomes.
-     *
-     * Example:
-     * [
-     *     'comment_jobs_completed' => 1,
-     *     'comment_jobs_failed' => 0,
-     * ]
-     *
      * @param array<string, mixed> $counters
      */
     public function markPipelineJobsCompleted(
@@ -717,8 +673,6 @@ final class FacebookSyncRunService
     }
 
     /**
-     * Record a downstream pipeline operation exactly once.
-     *
      * @param array<string, mixed> $counters
      * @return array{run: FacebookSyncRun, applied: bool}
      */
@@ -773,11 +727,6 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Return true when all expected downstream jobs have finished.
-     *
-     * A job is considered finished if it completed successfully or failed.
-     */
     public function isPipelineComplete(
         FacebookSyncRun $run,
     ): bool {
@@ -818,9 +767,6 @@ final class FacebookSyncRunService
         return true;
     }
 
-    /**
-     * Complete the run when all downstream pipeline jobs have finished.
-     */
     public function completePipelineIfReady(
         string $runId,
     ): FacebookSyncRun {
@@ -878,8 +824,6 @@ final class FacebookSyncRunService
     /**
      * Increment synchronization statistics.
      *
-     * All values are validated before any in-memory mutation.
-     *
      * @param array<string, mixed> $statistics
      */
     public function incrementStatistics(
@@ -916,9 +860,88 @@ final class FacebookSyncRunService
     }
 
     /**
-     * Set synchronization statistics to exact values.
+     * Increment synchronization statistics exactly once per operation key.
      *
-     * Only running runs may be modified.
+     * The run row lock serializes updates to both statistics and their
+     * operation records. A repeated operation key is ignored.
+     *
+     * @param array<string, mixed> $statistics
+     * @return array{run: FacebookSyncRun, applied: bool}
+     */
+    public function incrementStatisticsOnce(
+        string $runId,
+        string $operationKey,
+        array $statistics,
+    ): array {
+        $operationKey = trim($operationKey);
+
+        $this->validateOperationKey($operationKey);
+
+        return DB::transaction(function () use (
+            $runId,
+            $operationKey,
+            $statistics,
+        ): array {
+            /** @var FacebookSyncRun $run */
+            $run = FacebookSyncRun::query()
+                ->lockForUpdate()
+                ->findOrFail($runId);
+
+            $this->assertStatisticsWritable($run);
+
+            foreach ($statistics as $key => $value) {
+                $this->validateStatistic($key, $value);
+            }
+
+            $metadata = is_array($run->metadata)
+                ? $run->metadata
+                : [];
+
+            $operations = is_array(
+                $metadata['statistics_operations'] ?? null,
+            )
+                ? $metadata['statistics_operations']
+                : [];
+
+            if (isset($operations[$operationKey])) {
+                return [
+                    'run' => $run->refresh(),
+                    'applied' => false,
+                ];
+            }
+
+            foreach ($statistics as $key => $value) {
+                $run->{$key} = ((int) $run->{$key}) + $value;
+            }
+
+            $operations[$operationKey] = [
+                'recorded_at' => now()->toIso8601String(),
+            ];
+
+            if (count($operations) > self::MAX_PIPELINE_OPERATION_KEYS) {
+                $operations = array_slice(
+                    $operations,
+                    -self::MAX_PIPELINE_OPERATION_KEYS,
+                    null,
+                    true,
+                );
+            }
+
+            $metadata['statistics_operations'] = $operations;
+
+            $run->metadata = $metadata;
+            $run->last_heartbeat_at = now();
+            $run->save();
+
+            return [
+                'run' => $run->refresh(),
+                'applied' => true,
+            ];
+        }, attempts: 3);
+    }
+
+    /**
+     * Set synchronization statistics to exact values.
      *
      * @param array<string, mixed> $statistics
      */
@@ -964,11 +987,6 @@ final class FacebookSyncRunService
     /**
      * Update run metadata.
      *
-     * This method intentionally allows metadata updates on terminal runs,
-     * for example to attach diagnostic information after a worker failure.
-     * Callers must not use it to change lifecycle fields or overwrite
-     * pipeline state without appropriate validation.
-     *
      * @param array<string, mixed> $metadata
      */
     public function updateMetadata(
@@ -1009,8 +1027,7 @@ final class FacebookSyncRunService
     /**
      * Mark a running synchronization as successfully completed.
      *
-     * Use only when there is no asynchronous downstream pipeline work
-     * remaining. Otherwise, use completePipelineIfReady().
+     * Use this only when no asynchronous downstream work remains.
      *
      * @param array<string, mixed> $statistics
      */
@@ -1063,12 +1080,6 @@ final class FacebookSyncRunService
     |--------------------------------------------------------------------------
     */
 
-    /**
-     * Mark a queued or running run as failed.
-     *
-     * Terminal runs are immutable; late failures from already-finished
-     * jobs do not overwrite their final status.
-     */
     public function markFailed(
         string $runId,
         Throwable|string $error,
@@ -1099,8 +1110,6 @@ final class FacebookSyncRunService
             $now = now();
 
             $run->status = FacebookSyncStatus::FAILED;
-
-            // A failure is not a successful completion.
             $run->completed_at = null;
             $run->finished_at = $now;
             $run->last_heartbeat_at = $now;
@@ -1159,8 +1168,6 @@ final class FacebookSyncRunService
     }
 
     /**
-     * Normalize pipeline metadata and counters.
-     *
      * @param array<string, mixed> $metadata
      * @return array<string, mixed>
      */
@@ -1196,6 +1203,25 @@ final class FacebookSyncRunService
     | Validation
     |--------------------------------------------------------------------------
     */
+
+    private function validateOperationKey(string $operationKey): void
+    {
+        if ($operationKey === '') {
+            throw ValidationException::withMessages([
+                'operation_key' => [
+                    'The operation key cannot be empty.',
+                ],
+            ]);
+        }
+
+        if (strlen($operationKey) > 255) {
+            throw ValidationException::withMessages([
+                'operation_key' => [
+                    'The operation key cannot exceed 255 characters.',
+                ],
+            ]);
+        }
+    }
 
     private function validateStatistic(
         string $key,
