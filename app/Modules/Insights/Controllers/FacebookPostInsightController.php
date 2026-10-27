@@ -20,6 +20,9 @@ class FacebookPostInsightController extends Controller
 
     /**
      * Queue AI insight generation for a Facebook post.
+     *
+     * An omitted date_range requests an all-time insight.
+     * A supplied date_range requests an insight for that exact period.
      */
     public function generate(
         GeneratePostInsightRequest $request,
@@ -32,11 +35,14 @@ class FacebookPostInsightController extends Controller
                 $validated['regenerate'] ?? false
             );
 
+            $dateFrom = $validated['date_range']['from'] ?? null;
+            $dateTo = $validated['date_range']['to'] ?? null;
+
             $insight = $this->insightService->queueGeneration(
                 postId: $postId,
                 language: $validated['language'],
-                dateFrom: $validated['date_range']['from'] ?? null,
-                dateTo: $validated['date_range']['to'] ?? null,
+                dateFrom: $dateFrom,
+                dateTo: $dateTo,
                 requestedModel: $validated['model'] ?? null,
                 forceRegeneration: $forceRegeneration,
             );
@@ -74,6 +80,8 @@ class FacebookPostInsightController extends Controller
                     'request_id' => $request->header('X-Request-ID'),
                     'post_id' => $postId,
                     'language' => $validated['language'] ?? null,
+                    'date_from' => $validated['date_range']['from'] ?? null,
+                    'date_to' => $validated['date_range']['to'] ?? null,
                     'model' => $validated['model'] ?? null,
                     'regenerate' => $validated['regenerate'] ?? false,
                     'exception' => $exception::class,
@@ -90,6 +98,8 @@ class FacebookPostInsightController extends Controller
 
     /**
      * Retrieve the latest completed insight for a Facebook post.
+     *
+     * Optionally filter by language and date range.
      */
     public function latest(
         Request $request,
@@ -102,24 +112,48 @@ class FacebookPostInsightController extends Controller
                     'string',
                     'in:en,am,or',
                 ],
+                'date_from' => [
+                    'sometimes',
+                    'nullable',
+                    'date_format:Y-m-d',
+                ],
+                'date_to' => [
+                    'sometimes',
+                    'nullable',
+                    'date_format:Y-m-d',
+                    'after_or_equal:date_from',
+                ],
             ]);
+
+            $dateFrom = $validated['date_from'] ?? null;
+            $dateTo = $validated['date_to'] ?? null;
+
+            if (($dateFrom === null) !== ($dateTo === null)) {
+                throw ValidationException::withMessages([
+                    'date_range' => [
+                        'Both date_from and date_to must be provided together.',
+                    ],
+                ]);
+            }
 
             $insight = $this->insightService->getLatestInsight(
                 postId: $postId,
                 language: $validated['language'] ?? null,
+                dateFrom: $dateFrom,
+                dateTo: $dateTo,
             );
 
             if (! $insight) {
                 return response()->json([
                     'success' => true,
-                    'message' => 'No completed insight was found for this post.',
+                    'message' => 'No completed insight was found for this post and date range.',
                     'data' => null,
                 ]);
             }
 
             return response()->json([
                 'success' => true,
-                'message' => 'Latest post insight retrieved successfully.',
+                'message' => 'Post insight retrieved successfully.',
                 'data' => PostAiInsightResource::make($insight)
                     ->resolve($request),
             ]);
@@ -131,7 +165,7 @@ class FacebookPostInsightController extends Controller
             ], 422);
         } catch (Throwable $exception) {
             Log::error(
-                'Failed to retrieve latest Facebook post insight.',
+                'Failed to retrieve Facebook post insight.',
                 [
                     'request_id' => $request->header('X-Request-ID'),
                     'post_id' => $postId,
@@ -142,7 +176,7 @@ class FacebookPostInsightController extends Controller
 
             return response()->json([
                 'success' => false,
-                'message' => 'Unable to retrieve the latest post insight.',
+                'message' => 'Unable to retrieve the post insight.',
             ], 500);
         }
     }
@@ -169,6 +203,17 @@ class FacebookPostInsightController extends Controller
                     'string',
                     'max:100',
                 ],
+                'date_from' => [
+                    'sometimes',
+                    'nullable',
+                    'date_format:Y-m-d',
+                ],
+                'date_to' => [
+                    'sometimes',
+                    'nullable',
+                    'date_format:Y-m-d',
+                    'after_or_equal:date_from',
+                ],
                 'from' => [
                     'sometimes',
                     'nullable',
@@ -187,6 +232,17 @@ class FacebookPostInsightController extends Controller
                     'max:100',
                 ],
             ]);
+
+            $dateFrom = $validated['date_from'] ?? null;
+            $dateTo = $validated['date_to'] ?? null;
+
+            if (($dateFrom === null) !== ($dateTo === null)) {
+                throw ValidationException::withMessages([
+                    'date_range' => [
+                        'Both date_from and date_to must be provided together.',
+                    ],
+                ]);
+            }
 
             $insights = $this->insightService->paginateInsights(
                 filters: $validated,

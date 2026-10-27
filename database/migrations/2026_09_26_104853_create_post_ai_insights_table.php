@@ -1,7 +1,9 @@
+
 <?php
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
@@ -20,6 +22,24 @@ return new class extends Migration
             $table->uuid('facebook_post_id');
 
             $table->string('language', 2)->default('en');
+
+            /*
+            |--------------------------------------------------------------------------
+            | Analysis Date Range
+            |--------------------------------------------------------------------------
+            |
+            | NULL date_from and date_to represent an all-time insight.
+            |
+            | Examples:
+            | 2026-09-01 to 2026-09-15
+            | 2026-09-16 to 2026-09-30
+            | 2026-09-01 to 2026-09-30
+            |
+            */
+
+            $table->date('date_from')->nullable();
+
+            $table->date('date_to')->nullable();
 
             /*
             |--------------------------------------------------------------------------
@@ -124,17 +144,9 @@ return new class extends Migration
 
             /*
             |--------------------------------------------------------------------------
-            | Constraints And Indexes
+            | Indexes
             |--------------------------------------------------------------------------
-            |
-            | One current insight per post and language.
-            |
             */
-
-            $table->unique(
-                ['facebook_post_id', 'language'],
-                'post_ai_insights_post_language_unique'
-            );
 
             $table->index(
                 ['status', 'created_at'],
@@ -147,6 +159,11 @@ return new class extends Migration
 
             $table->index('primary_topic');
 
+            $table->index(
+                ['facebook_post_id', 'language', 'date_from', 'date_to'],
+                'post_ai_insights_post_language_dates_index'
+            );
+
             /*
             |--------------------------------------------------------------------------
             | Facebook Post Relationship
@@ -158,6 +175,59 @@ return new class extends Migration
                 ->on('facebook_posts')
                 ->cascadeOnDelete();
         });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Unique Insight Constraints
+        |--------------------------------------------------------------------------
+        |
+        | PostgreSQL partial indexes:
+        |
+        | 1. One all-time insight per post and language.
+        | 2. One insight per exact date range, post, and language.
+        |
+        */
+
+        DB::statement('
+            CREATE UNIQUE INDEX post_ai_insights_all_time_unique
+            ON post_ai_insights (facebook_post_id, language)
+            WHERE date_from IS NULL AND date_to IS NULL
+        ');
+
+        DB::statement('
+            CREATE UNIQUE INDEX post_ai_insights_date_range_unique
+            ON post_ai_insights (
+                facebook_post_id,
+                language,
+                date_from,
+                date_to
+            )
+            WHERE date_from IS NOT NULL AND date_to IS NOT NULL
+        ');
+
+        /*
+        |--------------------------------------------------------------------------
+        | Date Range Validation
+        |--------------------------------------------------------------------------
+        |
+        | Both dates must be NULL or both must be supplied.
+        | When supplied, the start date cannot be after the end date.
+        |
+        */
+
+        DB::statement('
+            ALTER TABLE post_ai_insights
+            ADD CONSTRAINT post_ai_insights_date_range_check
+            CHECK (
+                (date_from IS NULL AND date_to IS NULL)
+                OR
+                (
+                    date_from IS NOT NULL
+                    AND date_to IS NOT NULL
+                    AND date_from <= date_to
+                )
+            )
+        ');
     }
 
     public function down(): void
