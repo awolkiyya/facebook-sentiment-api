@@ -61,256 +61,206 @@ class AuthController extends Controller
     |
     */
 
-    public function webLogin(
-        LoginRequest $request
-    ): JsonResponse {
-        Log::info('Web login attempt', [
+public function webLogin(
+    LoginRequest $request
+): JsonResponse {
+    Log::info('Web login attempt', [
+        'request_id' => $request->header('X-Request-ID'),
+        'email' => $request->input('email'),
+        'ip' => $request->ip(),
+        'user_agent' => $request->userAgent(),
+    ]);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validate Request
+    |--------------------------------------------------------------------------
+    */
+
+    $validated = $request->validated();
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validate Credentials
+    |--------------------------------------------------------------------------
+    */
+
+    $user = $this->authService->validateCredentials($validated);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Load System Security Settings
+    |--------------------------------------------------------------------------
+    */
+
+    $settings = SystemSetting::query()->first();
+
+    $requireTwoFactor = (bool) (
+        $settings?->require_two_factor ?? false
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Check User MFA State
+    |--------------------------------------------------------------------------
+    */
+
+    $mfaEnabled = $this->mfaService->hasEnabledTotp($user);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Remember Me
+    |--------------------------------------------------------------------------
+    */
+
+    $remember = (bool) (
+        $validated['remember'] ?? false
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | MFA Verification Required
+    |--------------------------------------------------------------------------
+    |
+    | Users who have already enabled MFA must verify it before
+    | completing login, regardless of the global setting.
+    |
+    */
+
+    if ($mfaEnabled) {
+        Log::info('MFA verification required for web login', [
             'request_id' => $request->header('X-Request-ID'),
-            'email' => $request->input('email'),
+            'user_id' => $user->id,
+            'email' => $user->email,
             'ip' => $request->ip(),
-            'user_agent' => $request->userAgent(),
         ]);
 
         /*
         |--------------------------------------------------------------------------
-        | Validate Request
+        | Create Pre-Authentication MFA Challenge
         |--------------------------------------------------------------------------
         */
 
-        $validated = $request->validated();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Validate Credentials
-        |--------------------------------------------------------------------------
-        */
-
-        $user = $this->authService->validateCredentials(
-            $validated
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Load System Security Settings
-        |--------------------------------------------------------------------------
-        */
-
-        $settings = SystemSetting::query()->first();
-
-        $requireTwoFactor = (bool) (
-            $settings?->require_two_factor ?? false
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Check User MFA State
-        |--------------------------------------------------------------------------
-        */
-
-        $mfaEnabled = $this->mfaService->hasEnabledTotp($user);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Remember Me
-        |--------------------------------------------------------------------------
-        */
-
-        $remember = (bool) (
-            $validated['remember'] ?? false
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | MFA Verification Required
-        |--------------------------------------------------------------------------
-        |
-        | If the user already has MFA enabled, MFA verification is
-        | always required during login.
-        |
-        | This is independent of the system-level require_two_factor
-        | setting.
-        |
-        */
-
-        if ($mfaEnabled) {
-            Log::info('MFA verification required for web login', [
-                'request_id' => $request->header('X-Request-ID'),
-                'user_id' => $user->id,
-                'email' => $user->email,
-                'ip' => $request->ip(),
-            ]);
-
-            /*
-            |--------------------------------------------------------------------------
-            | Create Pre-Authentication MFA Challenge
-            |--------------------------------------------------------------------------
-            */
-
-            $challenge = $this->mfaLoginChallengeService
-                ->createChallenge(
-                    $user,
-                    $remember
-                );
-
-            Log::info('MFA login challenge created', [
-                'request_id' => $request->header('X-Request-ID'),
-                'user_id' => $user->id,
-                'challenge_id' => $challenge['challenge_id'],
-                'expires_in' => $challenge['expires_in'],
-                'ip' => $request->ip(),
-            ]);
-
-            return ApiResponse::success(
-                data: [
-                    'mfa_required' => true,
-                    'mfa_enabled' => true,
-                    'mfa_setup_required' => false,
-                    'challenge_required' => true,
-                    'challenge_id' => $challenge['challenge_id'],
-                    'expires_in' => $challenge['expires_in'],
-                ],
-                message: 'Two-factor authentication is required.',
+        $challenge = $this->mfaLoginChallengeService
+            ->createChallenge(
+                $user,
+                $remember
             );
-        }
 
-        /*
-        |--------------------------------------------------------------------------
-        | MFA Setup Required
-        |--------------------------------------------------------------------------
-        |
-        | The system requires MFA, but this user has not configured it.
-        |
-        | Do NOT create the authenticated Laravel session yet.
-        |
-        */
+        Log::info('MFA login challenge created', [
+            'request_id' => $request->header('X-Request-ID'),
+            'user_id' => $user->id,
+            'challenge_id' => $challenge['challenge_id'],
+            'expires_in' => $challenge['expires_in'],
+            'ip' => $request->ip(),
+        ]);
 
-        if ($requireTwoFactor && !$mfaEnabled) {
-            Log::info('MFA setup required for web login', [
-                'request_id' => $request->header('X-Request-ID'),
-                'user_id' => $user->id,
-                'email' => $user->email,
-                'ip' => $request->ip(),
-            ]);
-
-            /*
-            |--------------------------------------------------------------------------
-            | Create MFA Setup Challenge
-            |--------------------------------------------------------------------------
-            */
-
-            $challenge = $this->mfaLoginChallengeService
-                ->createChallenge(
-                    $user,
-                    $remember
-                );
-
-            Log::info('MFA setup challenge created', [
-                'request_id' => $request->header('X-Request-ID'),
-                'user_id' => $user->id,
-                'challenge_id' => $challenge['challenge_id'],
-                'expires_in' => $challenge['expires_in'],
-                'ip' => $request->ip(),
-            ]);
-
-            return ApiResponse::success(
-                data: [
-                    'mfa_required' => true,
-                    'mfa_enabled' => false,
-                    'mfa_setup_required' => true,
-                    'challenge_required' => true,
-                    'challenge_id' => $challenge['challenge_id'],
-                    'expires_in' => $challenge['expires_in'],
-                ],
-                message: 'Two-factor authentication setup is required.',
-            );
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Create Laravel Web Session
-        |--------------------------------------------------------------------------
-        */
-
-        $this->authSessionService->authenticate(
-            $request,
-            $user
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Update Last Login
-        |--------------------------------------------------------------------------
-        */
-
-        $user->forceFill([
-            'last_login_at' => now(),
-        ])->save();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Load User Relations
-        |--------------------------------------------------------------------------
-        */
-
-        $this->loadUserRelations($user);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Determine Primary Role
-        |--------------------------------------------------------------------------
-        */
-
-        $primaryRole = null;
-
-        if ($user->roles->isNotEmpty()) {
-            $primaryRole = $user->roles
-                ->first()
-                ->name;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Build Response
-        |--------------------------------------------------------------------------
-        */
-
-        $resource = new AuthUserResource($user);
-
-        $response = ApiResponse::success(
+        return ApiResponse::success(
             data: [
-                'authenticated' => true,
-                'user' => $resource->resolve(),
-                'security' => [
-                    'require_two_factor' => $requireTwoFactor,
-                    'mfa_setup_required' => false,
-                    'mfa_verified' => false,
-                ],
+                'mfa_required' => true,
+                'mfa_enabled' => true,
+                'mfa_setup_required' => false,
+                'challenge_required' => true,
+                'challenge_id' => $challenge['challenge_id'],
+                'expires_in' => $challenge['expires_in'],
             ],
-            message: 'Login successful.',
+            message: 'Two-factor authentication verification is required.',
         );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Frontend Role Cookie
-        |--------------------------------------------------------------------------
-        |
-        | Frontend routing hint only.
-        | Never use this for backend authorization.
-        |
-        */
-
-        if ($primaryRole !== null) {
-            $response->withCookie(
-                cookie(
-                    'role',
-                    $primaryRole,
-                    $remember ? 43200 : 120
-                )
-            );
-        }
-
-        return $response;
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Create Laravel Web Session
+    |--------------------------------------------------------------------------
+    |
+    | Users without configured MFA can log in normally.
+    | If MFA is required globally, the dashboard can prompt them
+    | to configure it after login.
+    |
+    */
+
+    $this->authSessionService->authenticate(
+        $request,
+        $user
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Update Last Login
+    |--------------------------------------------------------------------------
+    */
+
+    $user->forceFill([
+        'last_login_at' => now(),
+    ])->save();
+
+    /*
+    |--------------------------------------------------------------------------
+    | Load User Relations
+    |--------------------------------------------------------------------------
+    */
+
+    $this->loadUserRelations($user);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Determine Primary Role
+    |--------------------------------------------------------------------------
+    */
+
+    $primaryRole = null;
+
+    if ($user->roles->isNotEmpty()) {
+        $primaryRole = $user->roles
+            ->first()
+            ->name;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Build Response
+    |--------------------------------------------------------------------------
+    */
+
+    $resource = new AuthUserResource($user);
+
+    $response = ApiResponse::success(
+        data: [
+            'authenticated' => true,
+            'user' => $resource->resolve(),
+            'security' => [
+                'require_two_factor' => $requireTwoFactor,
+                'mfa_setup_required' => (
+                    $requireTwoFactor && !$mfaEnabled
+                ),
+                'mfa_verified' => false,
+            ],
+        ],
+        message: 'Login successful.',
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Frontend Role Cookie
+    |--------------------------------------------------------------------------
+    |
+    | Frontend routing hint only.
+    | Never use this for backend authorization.
+    |
+    */
+
+    if ($primaryRole !== null) {
+        $response->withCookie(
+            cookie(
+                'role',
+                $primaryRole,
+                $remember ? 43200 : 120
+            )
+        );
+    }
+
+    return $response;
+}
 
     /*
     |--------------------------------------------------------------------------
